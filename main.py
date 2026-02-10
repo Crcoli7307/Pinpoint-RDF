@@ -1,5 +1,5 @@
 """
-PINPOINT Direction Finding v7.2.4 New UI Update
+PINPOINT Direction Finding v7.4.0 Tests and CI Update
 """
 
 import os
