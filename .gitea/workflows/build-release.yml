@@ -31,7 +31,7 @@ jobs:
         run: |
           $cmd = Get-Content compile_command.txt -Raw
           $py = $env:PYTHON_EXE
-          $cmd = $cmd -replace '^\s*pyinstaller\b', "`"$py`" -m pyinstaller"
+          $cmd = $cmd -replace '^\s*pyinstaller\b', "`"$py`" -m PyInstaller"
           Write-Host "Running: $cmd"
           cmd /c $cmd
 
