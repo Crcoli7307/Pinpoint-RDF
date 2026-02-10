@@ -56,6 +56,21 @@ jobs:
         shell: powershell
         run: |
           $cmd = Get-Content compile_command.txt -Raw
+          $iconPath = Resolve-Path "app.ico" -ErrorAction SilentlyContinue
+          if ($iconPath) {
+            $iconPath = $iconPath.Path
+            if ($cmd -match '--icon(=|\s+)') {
+              $cmd = [regex]::Replace($cmd, '--icon(=|\s+)"?([^"\s]+)"?', {
+                param($m)
+                return "--icon=`"$iconPath`""
+              })
+            } else {
+              $cmd = "$cmd --icon=`"$iconPath`""
+            }
+            Write-Host "Using icon: $iconPath"
+          } else {
+            Write-Host "app.ico not found; skipping icon override."
+          }
           # Drop --add-data entries for gitignored or missing sources.
           $cmd = [regex]::Replace($cmd, '--add-data\s+"([^"]+)"', {
             param($m)

@@ -1,5 +1,5 @@
 """
-PINPOINT Direction Finding v7.5.0-hotfix3 Tests and CI Update
+PINPOINT Direction Finding v7.5.0-hotfix4 Tests and CI Update
 """
 
 import os
@@ -187,7 +187,7 @@ _ensure_librtlsdr_windows()
 # Your data pipeline
 import funcs
 
-def _transparentize_gif(src_path: str) -> str:
+def _transparentize_gif(src_path: str, allow_processing: bool = True) -> str:
     """
     Create a cached GIF with white/near-white pixels made transparent.
     Falls back to the original path on any failure.
@@ -200,6 +200,8 @@ def _transparentize_gif(src_path: str) -> str:
         cache_path = os.path.join(tempfile.gettempdir(), cache_name)
         if os.path.exists(cache_path):
             return cache_path
+        if not allow_processing:
+            return src_path
 
         frames = []
         durations = []
@@ -434,9 +436,16 @@ _load_env_file(".env")
 
 # Read Mapbox token from environment to avoid hard-coding secrets.
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
+MAPBOX_TOKEN_OVERRIDE: Optional[str] = None
+
+
+def _get_mapbox_token() -> Optional[str]:
+    token = MAPBOX_TOKEN or (MAPBOX_TOKEN_OVERRIDE or "")
+    token = token.strip()
+    return token if token else None
 
 APP_TITLE = "PINPOINT Direction Finding"
-APP_VERSION = "v7.5.0-hotfix3"
+APP_VERSION = "v7.5.0-hotfix4"
 APP_ICON_PATH = _resource_path("app.ico")
 IMAGE_PATH = "map.png"
 PINPOINT_IMAGE_FALLBACK = _resource_path("pinpoint.png")  # used by Clear App
@@ -1048,12 +1057,13 @@ class CollectorThread(QtCore.QThread):
                             "snr": quality.get("snr", 0.0),
                             "ts": ts,
                         }
-                    # Update map using token from environment. Skip update if token missing.
-                    if MAPBOX_TOKEN and history:
+                    # Update map using token from environment or settings override. Skip update if token missing.
+                    token = _get_mapbox_token()
+                    if token and history:
                         now = time.time()
                         if now - last_map_update >= MAP_UPDATE_INTERVAL_S:
                             try:
-                                funcs.mapFunction(history, MAPBOX_TOKEN, self.logger)
+                                funcs.mapFunction(history, token, self.logger)
                                 last_map_update = now
                             except Exception:
                                 # Ensure map errors don't kill the record loop and include traceback
@@ -1215,6 +1225,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.aoa_weight_input = QtWidgets.QLineEdit()
         self.map_weight_input = QtWidgets.QLineEdit()
         self.conf_threshold_input = QtWidgets.QLineEdit()
+        self.mapbox_input = QtWidgets.QLineEdit()
 
         # Validators
         self.freq_input.setValidator(QtGui.QDoubleValidator(bottom=0.0))
@@ -1238,6 +1249,12 @@ class SettingsDialog(QtWidgets.QDialog):
             self.aoa_weight_input.setText(str(settings.fusion_aoa_weight))
             self.map_weight_input.setText(str(settings.fusion_map_weight))
             self.conf_threshold_input.setText(str(settings.confidence_threshold))
+        if MAPBOX_TOKEN:
+            self.mapbox_input.setText(MAPBOX_TOKEN)
+            self.mapbox_input.setEnabled(False)
+            self.mapbox_input.setToolTip("Loaded from MAPBOX_TOKEN environment variable.")
+        else:
+            self.mapbox_input.setText(MAPBOX_TOKEN_OVERRIDE or "")
 
         form = QtWidgets.QFormLayout()
         form.addRow("Frequency (MHz)", self.freq_input)
@@ -1260,6 +1277,7 @@ class SettingsDialog(QtWidgets.QDialog):
         form.addRow("Calibration Profile", self.profile_input)
         form.addRow("Fusion Weight (AoA)", self.aoa_weight_input)
         form.addRow("Fusion Weight (Map)", self.map_weight_input)
+        form.addRow("Mapbox API Token", self.mapbox_input)
         form.addRow("Confidence Threshold", self.conf_threshold_input)
 
         btns = QtWidgets.QDialogButtonBox(
@@ -1301,6 +1319,9 @@ class SettingsDialog(QtWidgets.QDialog):
                 settings.fusion_aoa_weight = aoa_weight
                 settings.fusion_map_weight = map_weight
                 settings.confidence_threshold = conf_threshold
+            global MAPBOX_TOKEN_OVERRIDE
+            if not MAPBOX_TOKEN:
+                MAPBOX_TOKEN_OVERRIDE = self.mapbox_input.text().strip()
             logger.info(f"Settings updated: {settings.to_dict()}")
             self.accept()
         except ValueError:
@@ -1434,9 +1455,9 @@ class LogWindow(QtWidgets.QDialog):
                 f.seek(start_pos)
                 chunk = f.read()
             if chunk:
-                self.text.moveCursor(QtGui.QTextCursor.End)
+                self.text.moveCursor(QtGui.QTextCursor.MoveOperation.End)
                 self.text.insertPlainText(chunk)
-                self.text.moveCursor(QtGui.QTextCursor.End)
+                self.text.moveCursor(QtGui.QTextCursor.MoveOperation.End)
             self._last_size = cur_size
         except Exception as e:
             # Avoid noisy message boxes; surface in UI text instead
@@ -2187,7 +2208,7 @@ class BusyDialog(QtWidgets.QDialog):
 
         asset = _status_anim_for_mode(mode)
         if asset and os.path.exists(asset):
-            processed_asset = _transparentize_gif(asset)
+            processed_asset = _transparentize_gif(asset, allow_processing=False)
             movie = QtGui.QMovie(processed_asset)
             if movie.isValid():
                 movie.setScaledSize(QtCore.QSize(LOADING_ICON_PX, LOADING_ICON_PX))
