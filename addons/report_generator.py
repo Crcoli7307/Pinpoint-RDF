@@ -51,7 +51,7 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
         self._settings = self._data.get("settings") or {}
         self._map_png_b64 = self._data.get("map_png_b64")
         self._start_time = self._parse_start_time(self._data.get("start_time"))
-        self._app_version = self._data.get("app_version") or "v7.5.0-hotfix2"
+        self._app_version = self._data.get("app_version") or "v7.5.0-hotfix3"
 
         self._primary_color = QtGui.QColor("#0f766e")
         self._accent_color = QtGui.QColor("#334155")

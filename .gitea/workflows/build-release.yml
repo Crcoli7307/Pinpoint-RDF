@@ -28,12 +28,16 @@ jobs:
           if (-not $sha) { $sha = (git rev-parse HEAD).Trim() }
           $short = if ($sha.Length -ge 8) { $sha.Substring(0, 8) } else { $sha }
           $tag = "$version-$short"
+          $releaseName = "Pinpoint Release $version"
           Write-Host "Resolved app version: $version"
           Write-Host "Resolved release tag: $tag"
+          Write-Host "Resolved release name: $releaseName"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$version" -Encoding utf8
           Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag" -Encoding utf8
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "release_name=$releaseName" -Encoding utf8
           Add-Content -Path $env:GITHUB_ENV -Value "PINPOINT_VERSION=$version" -Encoding utf8
           Add-Content -Path $env:GITHUB_ENV -Value "PINPOINT_VERSION_TAG=$tag" -Encoding utf8
+          Add-Content -Path $env:GITHUB_ENV -Value "PINPOINT_RELEASE_NAME=$releaseName" -Encoding utf8
 
       - name: Verify Python (preinstalled)
         shell: powershell
@@ -90,9 +94,9 @@ jobs:
       - name: Create release and upload exe
         uses: https://git.bjxgj.com/actions/gitea-release-action@v1
         with:
-          tag_name: ${{ steps.app_version.outputs.tag }}
+          tag_name: ${{ env.PINPOINT_VERSION_TAG }}
           target_commitish: ${{ github.sha }}
-          name: Pinpoint ${{ steps.app_version.outputs.version }}
+          name: ${{ env.PINPOINT_RELEASE_NAME }}
           files: dist/Pinpoint.exe
           server_url: ${{ github.server_url }}
           repository: ${{ github.repository }}
