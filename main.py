@@ -1,5 +1,5 @@
 """
-PINPOINT Direction Finding v7.5.0-hotfix5
+PINPOINT Direction Finding v7.5.1
 """
 
 import os
@@ -25,6 +25,7 @@ from PIL import Image, ImageSequence
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from addons.report_generator import ReportGeneratorDialog
+from addons.history_exporter import HistoryExportDialog
 from addons.meshtastic_connectivity import (
     MeshtasticConnectivityDialog,
     MeshtasticReadNodeDialog,
@@ -287,6 +288,35 @@ def _transparentize_gif(src_path: str, allow_processing: bool = True) -> str:
         return src_path
 
 
+def _transparentize_png(src_path: str) -> str:
+    """
+    Create a cached PNG with white/near-white pixels made transparent.
+    Falls back to the original path on any failure.
+    """
+    try:
+        mtime = os.path.getmtime(src_path)
+        key = f"{src_path}|{mtime}|{GIF_WHITE_THRESHOLD}"
+        digest = hashlib.md5(key.encode("utf-8")).hexdigest()  # nosec - non-crypto use
+        cache_name = f"pinpoint_png_{digest}.png"
+        cache_path = os.path.join(tempfile.gettempdir(), cache_name)
+        if os.path.exists(cache_path):
+            return cache_path
+
+        with Image.open(src_path) as im:
+            rgba = im.convert("RGBA")
+            data = list(rgba.getdata())
+            new_data = []
+            for r, g, b, a in data:
+                if r >= GIF_WHITE_THRESHOLD and g >= GIF_WHITE_THRESHOLD and b >= GIF_WHITE_THRESHOLD:
+                    new_data.append((r, g, b, 0))
+                else:
+                    new_data.append((r, g, b, a))
+            rgba.putdata(new_data)
+            rgba.save(cache_path, format="PNG")
+        return cache_path
+    except Exception:
+        return src_path
+
 def _status_anim_for_mode(mode: str) -> Optional[str]:
     return {
         "general": LOADING_ANIM_GENERAL,
@@ -448,6 +478,17 @@ class RecordingSession:
             frame["map_png"] = map_b64
         self._write_line(frame)
 
+    def record_flag(self, reason: str, note: str = "") -> None:
+        t = time.time() - self.start_time
+        flag = {
+            "type": "flag",
+            "t": round(t, 3),
+            "reason": reason,
+            "note": note,
+            "ts": time.time(),
+        }
+        self._write_line(flag)
+
     def close(self) -> None:
         try:
             self._fh.close()
@@ -498,7 +539,7 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 APP_TITLE = "PINPOINT Direction Finding"
-APP_VERSION = "v7.5.0-hotfix5"
+APP_VERSION = "v7.5.1"
 APP_ICON_PATH = _resource_path("app.ico")
 IMAGE_PATH = "map.png"
 PINPOINT_IMAGE_FALLBACK = _resource_path("pinpoint.png")  # used by Clear App
@@ -506,6 +547,7 @@ LOG_FILE = "main.log"
 MAX_WIDTH = 800
 MAX_HEIGHT = 600
 MAP_UPDATE_INTERVAL_S = 3.0
+MAPBOX_URL_MAX = _env_int("MAPBOX_URL_MAX", 1800)
 HISTORY_MAX_POINTS = _env_int("HISTORY_MAX_POINTS", 150)
 HISTORY_MAX_AGE_S = _env_float("HISTORY_MAX_AGE_S", 3600.0)
 REPORT_CACHE_MAX_FRAMES = _env_int("REPORT_CACHE_MAX_FRAMES", 5000)
@@ -524,6 +566,7 @@ LOADING_ANIM_STOP = _resource_path("assets", "gifs", "stopping.gif")
 LOADING_ANIM_START = _resource_path("assets", "gifs", "starting.gif")
 LOADING_ANIM_RUNNING = _resource_path("assets", "gifs", "running.gif")
 QUESTION_GIF = _resource_path("assets", "gifs", "question.gif")
+MARKER_PNG = _resource_path("assets", "pngs", "marker.png")
 LOADING_ANIM_PLAYBACK = _resource_path("assets", "gifs", "playback.gif")
 LOADING_ANIM_PAUSED = _resource_path("assets", "gifs", "paused.gif")
 ALERT_GIF = _resource_path("assets", "gifs", "alert.gif")
@@ -532,6 +575,15 @@ LOADING_ICON_PX = 64
 GIF_WHITE_THRESHOLD = 245
 GIF_TRANSPARENT_KEY = (255, 0, 255)
 SPLASH_DURATION_MS = 5000
+FLAG_REASON_OPTIONS = [
+    "Entering Search Area",
+    "Signal Spike",
+    "Target Acquired",
+    "Target Lost",
+    "Interference Observed",
+    "Operator Note",
+    "Other",
+]
 
 # ---------------------------
 # Logging setup
@@ -578,6 +630,7 @@ class Settings:
     fusion_aoa_weight: float = 0.7
     fusion_map_weight: float = 0.3
     confidence_threshold: float = 0.4
+    auto_tune_fusion: bool = True
 
     def to_dict(self):
         return {
@@ -591,6 +644,7 @@ class Settings:
             "fusion_aoa_weight": self.fusion_aoa_weight,
             "fusion_map_weight": self.fusion_map_weight,
             "confidence_threshold": self.confidence_threshold,
+            "auto_tune_fusion": self.auto_tune_fusion,
         }
 
 # Global shared settings with a lock for thread-safety
@@ -1141,19 +1195,24 @@ class CollectorThread(QtCore.QThread):
                             "ts": ts,
                         }
                         _prune_history(history, ts)
-                    # Update map using token from environment or settings override. Skip update if token missing.
+                    # Update map using token from environment or settings override.
+                    # If no token or network, a local offline map will be generated.
                     token = _get_mapbox_token()
-                    if token and history:
+                    if history:
                         now = time.time()
                         if now - last_map_update >= MAP_UPDATE_INTERVAL_S:
                             try:
-                                funcs.mapFunction(history, token, self.logger, max_markers=HISTORY_MAX_POINTS)
+                                funcs.mapFunction(
+                                    history,
+                                    token,
+                                    self.logger,
+                                    max_markers=HISTORY_MAX_POINTS,
+                                    max_url_len=MAPBOX_URL_MAX,
+                                )
                                 last_map_update = now
                             except Exception:
                                 # Ensure map errors don't kill the record loop and include traceback
                                 self.logger.exception("Error while updating map")
-                    else:
-                        self.logger.debug("MAPBOX_TOKEN not set; skipping map update.")
 
                     map_target_bearing = None
                     aoa_confidence = 0.0
@@ -1184,6 +1243,17 @@ class CollectorThread(QtCore.QThread):
                         aoa_w = float(settings.fusion_aoa_weight)
                         map_w = float(settings.fusion_map_weight)
                         conf_threshold = float(settings.confidence_threshold)
+                        auto_tune = bool(getattr(settings, "auto_tune_fusion", False))
+                    if auto_tune:
+                        aoa_factor = 0.5 + 0.5 * (aoa_confidence or 0.0)
+                        map_factor = 0.5 + 0.5 * (map_confidence or 0.0)
+                        if present_gps_loc is None:
+                            map_factor *= 0.1
+                        aoa_w *= aoa_factor
+                        map_w *= map_factor
+                        q = quality.get("quality") if isinstance(quality, dict) else None
+                        if q is not None:
+                            conf_threshold = max(0.05, min(0.95, conf_threshold * (1.1 - 0.6 * float(q))))
                     weight_total = max(1e-6, aoa_w + map_w)
                     aoa_w /= weight_total
                     map_w /= weight_total
@@ -1223,6 +1293,7 @@ class CollectorThread(QtCore.QThread):
                     self.telemetry.emit(
                         {
                             "gps_fix": num_sats is not None and present_gps_loc is not None,
+                            "gps_loc": present_gps_loc,
                             "sats": num_sats,
                             "fix_age_s": fix_age,
                             "strength": strength,
@@ -1310,6 +1381,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.map_weight_input = QtWidgets.QLineEdit()
         self.conf_threshold_input = QtWidgets.QLineEdit()
         self.mapbox_input = QtWidgets.QLineEdit()
+        self.auto_tune_checkbox = QtWidgets.QCheckBox("Auto-tune fusion weights and threshold")
 
         # Validators
         self.freq_input.setValidator(QtGui.QDoubleValidator(bottom=0.0))
@@ -1333,6 +1405,7 @@ class SettingsDialog(QtWidgets.QDialog):
             self.aoa_weight_input.setText(str(settings.fusion_aoa_weight))
             self.map_weight_input.setText(str(settings.fusion_map_weight))
             self.conf_threshold_input.setText(str(settings.confidence_threshold))
+            self.auto_tune_checkbox.setChecked(bool(settings.auto_tune_fusion))
         if MAPBOX_TOKEN:
             self.mapbox_input.setText(MAPBOX_TOKEN)
             self.mapbox_input.setEnabled(False)
@@ -1363,6 +1436,7 @@ class SettingsDialog(QtWidgets.QDialog):
         form.addRow("Fusion Weight (Map)", self.map_weight_input)
         form.addRow("Mapbox API Token", self.mapbox_input)
         form.addRow("Confidence Threshold", self.conf_threshold_input)
+        form.addRow("Auto-Tune Fusion", self.auto_tune_checkbox)
 
         btns = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Save
@@ -1392,6 +1466,7 @@ class SettingsDialog(QtWidgets.QDialog):
             aoa_weight = float(self.aoa_weight_input.text())
             map_weight = float(self.map_weight_input.text())
             conf_threshold = float(self.conf_threshold_input.text())
+            auto_tune = self.auto_tune_checkbox.isChecked()
             with settings_lock:
                 settings.frequency = freq
                 settings.gain = gain
@@ -1403,6 +1478,7 @@ class SettingsDialog(QtWidgets.QDialog):
                 settings.fusion_aoa_weight = aoa_weight
                 settings.fusion_map_weight = map_weight
                 settings.confidence_threshold = conf_threshold
+                settings.auto_tune_fusion = auto_tune
             global MAPBOX_TOKEN_OVERRIDE
             if not MAPBOX_TOKEN:
                 MAPBOX_TOKEN_OVERRIDE = self.mapbox_input.text().strip()
@@ -1882,8 +1958,8 @@ class CompassWidget(QtWidgets.QWidget):
         painter.restore()
 
         # Center info box
-        box_w = radius * 1.2
-        box_h = radius * 0.5
+        box_w = radius * 1.4
+        box_h = radius * 0.65
         box_rect = QtCore.QRectF(
             center.x() - box_w / 2.0,
             center.y() - box_h / 2.0,
@@ -1907,17 +1983,70 @@ class CompassWidget(QtWidgets.QWidget):
         tgt_rel = "--" if self._target_relative is None else f"Turn {self._target_relative:+.0f}deg"
         tgt_abs = "--" if self._target_bearing is None else f"Abs {self._target_bearing:.0f}deg"
 
-        painter.setPen(QtGui.QColor("#10b981"))
-        painter.drawText(top_rect.adjusted(8, 4, -8, -4), QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop, "Current Heading")
-        painter.drawText(top_rect.adjusted(8, 4, -8, -4), QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignTop, cur_text)
-        painter.setPen(QtGui.QColor("#6b7280"))
-        painter.drawText(top_rect.adjusted(8, 4, -8, -4), QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignBottom, cur_abs)
+        # Split center box into left/right columns to prevent overlap
+        label_font = painter.font()
+        value_font = QtGui.QFont(label_font)
+        small_font = QtGui.QFont(label_font)
+        value_font.setPointSize(max(9, label_font.pointSize()))
+        small_font.setPointSize(max(8, label_font.pointSize() - 1))
 
+        def _split(rect: QtCore.QRectF) -> tuple[QtCore.QRectF, QtCore.QRectF]:
+            left_w = rect.width() * 0.36
+            left = QtCore.QRectF(rect.left() + 8, rect.top() + 4, left_w - 10, rect.height() - 8)
+            right = QtCore.QRectF(rect.left() + left_w, rect.top() + 4, rect.width() - left_w - 8, rect.height() - 8)
+            return left, right
+
+        def _elide(text: str, font: QtGui.QFont, width: float) -> str:
+            fm = QtGui.QFontMetrics(font)
+            return fm.elidedText(text, QtCore.Qt.TextElideMode.ElideRight, int(max(0, width)))
+
+        top_left, top_right = _split(top_rect)
+        bot_left, bot_right = _split(bot_rect)
+
+        def _draw_value_abs(rect: QtCore.QRectF, value_text: str, abs_text: str, value_color: QtGui.QColor):
+            v_font = QtGui.QFont(value_font)
+            s_font = QtGui.QFont(small_font)
+            gap = 3
+            while True:
+                fm_val = QtGui.QFontMetrics(v_font)
+                fm_small = QtGui.QFontMetrics(s_font)
+                line_h_val = fm_val.height()
+                line_h_small = fm_small.height()
+                needed = line_h_val + line_h_small + gap
+                if needed <= rect.height():
+                    break
+                shrunk = False
+                if v_font.pointSize() > 7:
+                    v_font.setPointSize(v_font.pointSize() - 1)
+                    shrunk = True
+                if s_font.pointSize() > 6:
+                    s_font.setPointSize(s_font.pointSize() - 1)
+                    shrunk = True
+                if gap > 1:
+                    gap -= 1
+                    shrunk = True
+                if not shrunk:
+                    break
+            value_rect = QtCore.QRectF(rect.left(), rect.top(), rect.width(), line_h_val)
+            abs_rect = QtCore.QRectF(rect.left(), rect.top() + line_h_val + gap, rect.width(), line_h_small)
+            painter.setFont(v_font)
+            painter.setPen(value_color)
+            painter.drawText(value_rect, QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignTop, _elide(value_text, v_font, rect.width()))
+            painter.setFont(s_font)
+            painter.setPen(QtGui.QColor("#6b7280"))
+            painter.drawText(abs_rect, QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignTop, _elide(abs_text, s_font, rect.width()))
+
+        painter.setFont(label_font)
+        painter.setPen(QtGui.QColor("#10b981"))
+        label_cur = _elide("Current", label_font, top_left.width())
+        painter.drawText(top_left, QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop, label_cur)
+        _draw_value_abs(top_right, cur_text, cur_abs, QtGui.QColor("#10b981"))
+
+        painter.setFont(label_font)
         painter.setPen(QtGui.QColor("#ef4444"))
-        painter.drawText(bot_rect.adjusted(8, 4, -8, -4), QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop, "Target Bearing")
-        painter.drawText(bot_rect.adjusted(8, 4, -8, -4), QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignTop, tgt_rel)
-        painter.setPen(QtGui.QColor("#6b7280"))
-        painter.drawText(bot_rect.adjusted(8, 4, -8, -4), QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignBottom, tgt_abs)
+        label_tgt = _elide("Target", label_font, bot_left.width())
+        painter.drawText(bot_left, QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop, label_tgt)
+        _draw_value_abs(bot_right, tgt_rel, tgt_abs, QtGui.QColor("#ef4444"))
 
         if self._source:
             conf_text = "--" if self._confidence is None else f"{self._confidence:.2f}"
@@ -1928,17 +2057,78 @@ class CompassWidget(QtWidgets.QWidget):
             )
 
 
+class SparklineWidget(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._values = []
+        self.setMinimumHeight(26)
+
+    def set_data(self, values):
+        self._values = list(values or [])
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect()
+        painter.fillRect(rect, QtGui.QColor("#ffffff"))
+
+        if not self._values:
+            painter.setPen(QtGui.QColor("#9ca3af"))
+            painter.drawText(rect, QtCore.Qt.AlignmentFlag.AlignCenter, "--")
+            return
+
+        vals = [v for v in self._values if v is not None]
+        if not vals:
+            painter.setPen(QtGui.QColor("#9ca3af"))
+            painter.drawText(rect, QtCore.Qt.AlignmentFlag.AlignCenter, "--")
+            return
+
+        min_val = 0.0
+        max_val = 1000.0
+        span = max(1e-6, max_val - min_val)
+        margin = 4
+        w = max(1, rect.width() - 2 * margin)
+        h = max(1, rect.height() - 2 * margin)
+        step = w / max(1, (len(self._values) - 1))
+
+        path = QtGui.QPainterPath()
+        started = False
+        for i, v in enumerate(self._values):
+            if v is None:
+                started = False
+                continue
+            try:
+                val = float(v)
+            except Exception:
+                started = False
+                continue
+            val = max(min_val, min(max_val, val))
+            x = rect.left() + margin + i * step
+            y = rect.top() + margin + (1.0 - (val - min_val) / span) * h
+            if not started:
+                path.moveTo(x, y)
+                started = True
+            else:
+                path.lineTo(x, y)
+
+        painter.setPen(QtGui.QPen(QtGui.QColor("#10b981"), 1.6))
+        painter.drawPath(path)
+
+
 class AntennaInfoDialog(QtWidgets.QDialog):
     def __init__(self, get_info, get_refresh_s, parent=None):
         super().__init__(parent)
         _apply_app_icon(self)
         self.setWindowTitle("Antenna Info")
-        self.resize(1100, 520)
+        self.resize(1300, 560)
 
         self._get_info = get_info
         self._get_refresh_s = get_refresh_s
         self._selected_index = None
         self._refreshing = False
+        self._spark_history = {}
+        self._spark_max_points = 40
 
         self.layout_widget = AntennaLayoutWidget()
         self.compass_widget = CompassWidget()
@@ -1948,9 +2138,11 @@ class AntennaInfoDialog(QtWidgets.QDialog):
         self.spacing_label = QtWidgets.QLabel("Spacing: --")
         self.spacing_label.setStyleSheet("color: #6b7280;")
 
-        self.table = QtWidgets.QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Antenna", "Strength", "SNR", "Status"])
-        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table = QtWidgets.QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Antenna", "Strength", "SNR", "Trend", "Status"])
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(True)
+        header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
@@ -1978,10 +2170,14 @@ class AntennaInfoDialog(QtWidgets.QDialog):
         right_panel.addWidget(self.detail_frame)
         right_panel.setSizes([320, 160])
 
+        self.layout_widget.setMaximumWidth(340)
+        self.compass_widget.setMaximumWidth(340)
+        right_panel.setMinimumWidth(560)
+
         plots = QtWidgets.QHBoxLayout()
         plots.addWidget(self.layout_widget, stretch=1)
         plots.addWidget(self.compass_widget, stretch=1)
-        plots.addWidget(right_panel, stretch=1)
+        plots.addWidget(right_panel, stretch=2)
 
         close_btn = QtWidgets.QPushButton("Close")
         close_btn.clicked.connect(self.close)
@@ -2091,6 +2287,7 @@ class AntennaInfoDialog(QtWidgets.QDialog):
                 bearing_source or "--",
                 fusion_conf if fusion_conf is not None else 0.0,
             )
+            self._update_spark_history(antenna_states)
             self._populate_table(antenna_states)
             if aoa_conf is not None and map_conf is not None and fusion_conf is not None:
                 source_text = (bearing_source or "--").upper()
@@ -2114,6 +2311,17 @@ class AntennaInfoDialog(QtWidgets.QDialog):
             self._timer.setInterval(self._refresh_interval_ms())
         finally:
             self._refreshing = False
+
+    def _update_spark_history(self, antenna_states):
+        active = set(range(len(antenna_states)))
+        for idx in list(self._spark_history.keys()):
+            if idx not in active:
+                self._spark_history.pop(idx, None)
+        for idx, state in enumerate(antenna_states):
+            hist = self._spark_history.setdefault(idx, [])
+            hist.append(state.get("strength"))
+            if len(hist) > self._spark_max_points:
+                self._spark_history[idx] = hist[-self._spark_max_points:]
 
     def _populate_table(self, antenna_states):
         selected = self._selected_index
@@ -2141,8 +2349,12 @@ class AntennaInfoDialog(QtWidgets.QDialog):
                 snr_bar.setFormat("%v")
             self.table.setCellWidget(row, 2, snr_bar)
 
+            spark = SparklineWidget()
+            spark.set_data(self._spark_history.get(row, []))
+            self.table.setCellWidget(row, 3, spark)
+
             status = "Connected" if state.get("connected") else "Disconnected"
-            self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(status))
+            self.table.setItem(row, 4, QtWidgets.QTableWidgetItem(status))
 
         if selected is not None and 0 <= selected < len(antenna_states):
             self.table.selectRow(selected)
@@ -2292,7 +2504,7 @@ class BusyDialog(QtWidgets.QDialog):
 
         asset = _status_anim_for_mode(mode)
         if asset and os.path.exists(asset):
-            processed_asset = _transparentize_gif(asset, allow_processing=False)
+            processed_asset = _transparentize_gif(asset, allow_processing=True)
             movie = QtGui.QMovie(processed_asset)
             if movie.isValid():
                 movie.setScaledSize(QtCore.QSize(LOADING_ICON_PX, LOADING_ICON_PX))
@@ -2372,6 +2584,42 @@ class RecordingPromptDialog(QtWidgets.QDialog):
     def _choose_skip(self):
         self.result_record = False
         self.accept()
+
+
+class FlagDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        _apply_app_icon(self)
+        self.setWindowTitle("Flag Event")
+        self.setMinimumWidth(360)
+        self.setModal(True)
+        self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowType.WindowContextHelpButtonHint)
+
+        self.reason_combo = QtWidgets.QComboBox()
+        self.reason_combo.addItems(list(FLAG_REASON_OPTIONS))
+        self.note_input = QtWidgets.QPlainTextEdit()
+        self.note_input.setPlaceholderText("Optional notes...")
+
+        form = QtWidgets.QFormLayout()
+        form.addRow("Reason", self.reason_combo)
+        form.addRow("Notes", self.note_input)
+
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(btns)
+
+    def flag_data(self) -> dict:
+        return {
+            "reason": (self.reason_combo.currentText() or "").strip(),
+            "note": self.note_input.toPlainText().strip(),
+        }
 
 
 class NoHardwareDialog(QtWidgets.QDialog):
@@ -2990,6 +3238,139 @@ class CalibrationThread(QtCore.QThread):
 
         self.done.emit(calibration)
 
+class FlaggedSlider(QtWidgets.QSlider):
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self._flags = []
+        self._total_time = 0.0
+        self._last_tooltip = None
+        self._marker_pixmap = None
+        self._marker_size_px = 16
+        self.setMouseTracking(True)
+
+    def _get_marker_pixmap(self) -> Optional[QtGui.QPixmap]:
+        if self._marker_pixmap is not None:
+            return self._marker_pixmap
+        if not MARKER_PNG or not os.path.exists(MARKER_PNG):
+            self._marker_pixmap = None
+            return None
+        try:
+            processed = _transparentize_png(MARKER_PNG)
+            pix = QtGui.QPixmap(processed)
+            if pix.isNull():
+                self._marker_pixmap = None
+                return None
+            pix = pix.scaled(
+                self._marker_size_px,
+                self._marker_size_px,
+                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation,
+            )
+            self._marker_pixmap = pix
+            return pix
+        except Exception:
+            self._marker_pixmap = None
+            return None
+
+    def set_flags(self, flags: list[dict], total_time: float) -> None:
+        self._flags = list(flags or [])
+        try:
+            self._total_time = max(0.0, float(total_time or 0.0))
+        except Exception:
+            self._total_time = 0.0
+        self.update()
+
+    def _marker_positions(self):
+        if not self._flags or self._total_time <= 0:
+            return []
+        pix = self._get_marker_pixmap()
+        if pix is None or pix.isNull():
+            return []
+        opt = QtWidgets.QStyleOptionSlider()
+        self.initStyleOption(opt)
+        groove = self.style().subControlRect(
+            QtWidgets.QStyle.ComplexControl.CC_Slider,
+            opt,
+            QtWidgets.QStyle.SubControl.SC_SliderGroove,
+            self,
+        )
+        if groove.width() <= 0:
+            return []
+        markers = []
+        for flag in self._flags:
+            try:
+                t = float(flag.get("t", 0.0) or 0.0)
+            except Exception:
+                t = 0.0
+            frac = max(0.0, min(1.0, t / self._total_time))
+            x = groove.left() + int(frac * groove.width()) - int(pix.width() / 2)
+            top_space = groove.top()
+            bottom_space = self.height() - groove.bottom()
+            if bottom_space >= top_space:
+                y = min(self.height() - pix.height() - 2, groove.bottom() + 2)
+            else:
+                y = max(2, groove.top() - pix.height() - 2)
+            rect = QtCore.QRectF(x, y, pix.width(), pix.height())
+            markers.append(
+                {
+                    "flag": flag,
+                    "rect": rect,
+                    "pix": pix,
+                }
+            )
+        return markers
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        markers = self._marker_positions()
+        if not markers:
+            return
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        for marker in markers:
+            rect = marker["rect"]
+            pix = marker["pix"]
+            painter.drawPixmap(rect.topLeft(), pix)
+
+    def _tooltip_text(self, flag: dict) -> str:
+        reason = str(flag.get("reason") or "Flag").strip()
+        note = str(flag.get("note") or "").strip()
+        t = flag.get("t", None)
+        if t is None:
+            return f"{reason}\n{note}".strip()
+        return f"{reason} @ {self._fmt_time(t)}\n{note}".strip()
+
+    @staticmethod
+    def _fmt_time(seconds: float) -> str:
+        try:
+            seconds = max(0, int(seconds))
+        except Exception:
+            seconds = 0
+        m, s = divmod(seconds, 60)
+        return f"{m:02d}:{s:02d}"
+
+    def mouseMoveEvent(self, event):
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        for marker in self._marker_positions():
+            flag = marker["flag"]
+            rect = marker["rect"].adjusted(-2, -2, 2, 2)
+            if rect.contains(QtCore.QPointF(pos)):
+                text = self._tooltip_text(flag)
+                if text and text != self._last_tooltip:
+                    QtWidgets.QToolTip.showText(self.mapToGlobal(pos), text, self)
+                    self._last_tooltip = text
+                return
+        if self._last_tooltip:
+            QtWidgets.QToolTip.hideText()
+            self._last_tooltip = None
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        if self._last_tooltip:
+            QtWidgets.QToolTip.hideText()
+            self._last_tooltip = None
+        super().leaveEvent(event)
+
 # ---------------------------
 # Main Window
 # ---------------------------
@@ -3041,6 +3422,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gps_info_btn = self._make_btn("GPS Info")
         self.antenna_info_btn = self._make_btn("Antenna Info")
         self.start_btn = self._make_btn("Start Data Collection", primary=True, wide=False)
+        self.flag_btn = self._make_btn("Flag")
+        self.flag_btn.setVisible(False)
 
         self.exit_btn.clicked.connect(self.close)
         self.clear_btn.clicked.connect(self.clear_app)
@@ -3050,6 +3433,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gps_info_btn.clicked.connect(self.open_gps_info)
         self.antenna_info_btn.clicked.connect(self.open_antenna_info)
         self.start_btn.clicked.connect(self.toggle_collection)
+        self.flag_btn.clicked.connect(self.open_flag_dialog)
 
         # Toolbar removed for cleaner menu-only utility layout
 
@@ -3104,6 +3488,8 @@ class MainWindow(QtWidgets.QMainWindow):
         right_col = QtWidgets.QVBoxLayout()
         right_col.addStretch(1)
         right_col.addWidget(self.info_status_gif, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+        right_col.addSpacing(6)
+        right_col.addWidget(self.flag_btn, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
         right_col.addStretch(1)
 
         info_layout = QtWidgets.QHBoxLayout(self.info_panel)
@@ -3117,9 +3503,10 @@ class MainWindow(QtWidgets.QMainWindow):
         pb_layout.setContentsMargins(0, 0, 0, 0)
 
         self.playback_play_btn = self._make_btn("Play")
-        self.playback_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.playback_slider = FlaggedSlider(QtCore.Qt.Orientation.Horizontal)
         self.playback_slider.setMinimum(0)
         self.playback_slider.setMaximum(0)
+        self.playback_slider.setMinimumHeight(40)
         self.playback_speed = QtWidgets.QComboBox()
         self.playback_speed.addItems(["1x", "2x", "4x", "8x", "16x", "32x"])
         self.playback_speed.setCurrentText("1x")
@@ -3185,6 +3572,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rescan_dialog: Optional[BusyDialog] = None
         self.playback_mode = False
         self.playback_frames: list[dict] = []
+        self.playback_flags: list[dict] = []
         self.playback_index = 0
         self.playback_speed_factor = 1.0
         self.playback_timer = QtCore.QTimer(self)
@@ -3273,6 +3661,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.report_action = QtGui.QAction("Report Generator", self)
         self.report_action.setEnabled(False)
         self.report_action.triggered.connect(self.open_report_generator)
+        self.history_export_action = QtGui.QAction("Export History...", self)
+        self.history_export_action.triggered.connect(self.open_history_exporter)
         self.meshtastic_action = QtGui.QAction("Meshtastic Connectivity", self)
         self.meshtastic_action.triggered.connect(self.open_meshtastic_connectivity)
 
@@ -3293,6 +3683,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         addons_menu.addAction(self.meshtastic_action)
         addons_menu.addAction(self.report_action)
+        addons_menu.addAction(self.history_export_action)
 
     def _build_toolbar(self):
         self.toolbar = QtWidgets.QToolBar("Controls")
@@ -3386,6 +3777,9 @@ class MainWindow(QtWidgets.QMainWindow):
         record_text = "ON" if self.recording_session is not None else "OFF"
         if self.recording_session is not None and self.recording_path:
             record_text = f"ON ({os.path.basename(self.recording_path)})"
+        flag_active = self.recording_session is not None and self.collecting and not self.playback_mode
+        self.flag_btn.setVisible(flag_active)
+        self.flag_btn.setEnabled(flag_active)
 
         activity = getattr(self, "last_status_msg", None) or ("Collecting" if self.collecting else "Idle")
 
@@ -3559,10 +3953,10 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QApplication.processEvents()
 
         try:
-            header, frames = self._load_pinplyr(path, progress_cb=_update_progress)
+            header, frames, flags = self._load_pinplyr(path, progress_cb=_update_progress)
         except Exception as e:
             load_error = e
-            header, frames = {}, []
+            header, frames, flags = {}, [], []
         finally:
             import_dialog.close()
             import_dialog.deleteLater()
@@ -3576,8 +3970,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.report_source_label = os.path.basename(path)
         self.report_cache_active = False
         self.report_header = header
+        self.playback_flags = flags
         self._refresh_report_action()
-        self._enter_playback(frames, header=header)
+        self._enter_playback(frames, header=header, flags=flags)
         return True
 
     def open_gps_info(self):
@@ -3602,6 +3997,24 @@ class MainWindow(QtWidgets.QMainWindow):
             dlg.exec()
         finally:
             self._antenna_info_dialog = None
+
+    def open_flag_dialog(self):
+        if self.recording_session is None or not self.collecting:
+            return
+        dlg = FlagDialog(self)
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            data = dlg.flag_data()
+            self._record_flag(data)
+
+    def _record_flag(self, data: dict) -> None:
+        if self.recording_session is None:
+            return
+        reason = (data.get("reason") or "Flag").strip()
+        note = (data.get("note") or "").strip()
+        try:
+            self.recording_session.record_flag(reason, note)
+        except Exception as e:
+            logger.error("Failed to record flag: %s", e)
 
     def _get_antenna_info(self):
         with settings_lock:
@@ -3632,9 +4045,10 @@ class MainWindow(QtWidgets.QMainWindow):
         }
 
     @staticmethod
-    def _load_pinplyr(path: str, progress_cb: Optional[Callable[[int], None]] = None) -> tuple[dict, list[dict]]:
+    def _load_pinplyr(path: str, progress_cb: Optional[Callable[[int], None]] = None) -> tuple[dict, list[dict], list[dict]]:
         header = {}
         frames = []
+        flags = []
         total_bytes = 0
         try:
             total_bytes = os.path.getsize(path)
@@ -3656,11 +4070,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 obj = json.loads(line)
                 if obj.get("type") == "pinplyr":
                     header = obj
+                elif obj.get("type") == "flag":
+                    flags.append(obj)
                 else:
                     frames.append(obj)
         if progress_cb:
             progress_cb(100)
-        return header, frames
+        return header, frames, flags
 
     def toggle_collection(self):
         if self.playback_only or self.meshtastic_only:
@@ -3846,6 +4262,37 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg = ReportGeneratorDialog(self, self._get_report_data)
         dlg.exec()
 
+    def open_history_exporter(self):
+        dlg = HistoryExportDialog(self, self._get_history_points)
+        dlg.exec()
+
+    def _get_history_points(self) -> list[dict]:
+        frames = list(self.report_cache_frames or [])
+        points = []
+        for frame in frames:
+            tele = frame.get("telemetry") or {}
+            gps_loc = tele.get("gps_loc")
+            if not gps_loc:
+                continue
+            try:
+                lat, lon = gps_loc
+            except Exception:
+                continue
+            points.append(
+                {
+                    "t": frame.get("t"),
+                    "lat": lat,
+                    "lon": lon,
+                    "strength": tele.get("strength"),
+                    "snr": tele.get("snr"),
+                    "quality": tele.get("quality"),
+                    "gps_fix": tele.get("gps_fix"),
+                    "sats": tele.get("sats"),
+                    "bearing_source": tele.get("bearing_source"),
+                }
+            )
+        return points
+
     def _get_report_data(self) -> dict:
         with settings_lock:
             s = settings.to_dict()
@@ -3899,9 +4346,10 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.exec()
 
     # ---------- Playback ----------
-    def _enter_playback(self, frames: list[dict], header: Optional[dict] = None):
+    def _enter_playback(self, frames: list[dict], header: Optional[dict] = None, flags: Optional[list[dict]] = None):
         self.playback_mode = True
         self.playback_frames = frames
+        self.playback_flags = list(flags or [])
         self.playback_index = 0
         self.playback_speed_factor = 1.0
         self._playback_playing = False
@@ -3909,6 +4357,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.playback_slider.setMinimum(0)
         self.playback_slider.setMaximum(max(0, len(frames) - 1))
         self.playback_slider.setValue(0)
+        total_time = self._frame_time(len(frames) - 1) if frames else 0.0
+        self.playback_slider.set_flags(self.playback_flags, total_time)
         self.playback_speed.setCurrentText("1x")
         self.playback_widget.setVisible(True)
         self.start_btn.setEnabled(False)
@@ -3931,6 +4381,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pause_playback()
         self.playback_mode = False
         self.playback_frames = []
+        self.playback_flags = []
         self.playback_index = 0
         self.playback_widget.setVisible(False)
         self.start_btn.setEnabled(True)
@@ -3942,6 +4393,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "exit_playback_action"):
             self.exit_playback_action.setEnabled(False)
         self._playback_last_map_bytes = None
+        self.playback_slider.set_flags([], 0.0)
         self.update_image(force=True)
         self.image_timer.start()
         self._update_info_panel()

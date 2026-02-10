@@ -51,7 +51,7 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
         self._settings = self._data.get("settings") or {}
         self._map_png_b64 = self._data.get("map_png_b64")
         self._start_time = self._parse_start_time(self._data.get("start_time"))
-        self._app_version = self._data.get("app_version") or "v7.5.0-hotfix5"
+        self._app_version = self._data.get("app_version") or "v7.5.1"
 
         self._primary_color = QtGui.QColor("#0f766e")
         self._accent_color = QtGui.QColor("#334155")
@@ -61,6 +61,10 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
         self._stats_cache_key = None
         self._cycles_cache = None
         self._cycles_cache_key = None
+        self._preview_timer = QtCore.QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(300)
+        self._preview_timer.timeout.connect(self._sync_preview)
 
         self._build_ui()
         self._sync_preview()
@@ -168,21 +172,21 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
         layout.addWidget(self.tabs, 1)
         layout.addWidget(self.close_btn, alignment=QtCore.Qt.AlignmentFlag.AlignRight)
 
-        # Hook changes to preview
-        self.title_input.textChanged.connect(self._sync_preview)
-        self.mission_input.textChanged.connect(self._sync_preview)
-        self.operator_input.textChanged.connect(self._sync_preview)
-        self.version_input.textChanged.connect(self._sync_preview)
-        self.abstract_input.textChanged.connect(self._sync_preview)
-        self.remarks_input.textChanged.connect(self._sync_preview)
-        self.section_summary.stateChanged.connect(self._sync_preview)
-        self.section_narrative.stateChanged.connect(self._sync_preview)
-        self.section_cycles.stateChanged.connect(self._sync_preview)
-        self.section_overall.stateChanged.connect(self._sync_preview)
-        self.section_per_antenna.stateChanged.connect(self._sync_preview)
-        self.section_gps.stateChanged.connect(self._sync_preview)
-        self.section_map.stateChanged.connect(self._sync_preview)
-        self.cycle_len_input.valueChanged.connect(self._sync_preview)
+        # Hook changes to preview (debounced to avoid UI lag on large sessions)
+        self.title_input.textChanged.connect(self._schedule_preview)
+        self.mission_input.textChanged.connect(self._schedule_preview)
+        self.operator_input.textChanged.connect(self._schedule_preview)
+        self.version_input.textChanged.connect(self._schedule_preview)
+        self.abstract_input.textChanged.connect(self._schedule_preview)
+        self.remarks_input.textChanged.connect(self._schedule_preview)
+        self.section_summary.stateChanged.connect(self._schedule_preview)
+        self.section_narrative.stateChanged.connect(self._schedule_preview)
+        self.section_cycles.stateChanged.connect(self._schedule_preview)
+        self.section_overall.stateChanged.connect(self._schedule_preview)
+        self.section_per_antenna.stateChanged.connect(self._schedule_preview)
+        self.section_gps.stateChanged.connect(self._schedule_preview)
+        self.section_map.stateChanged.connect(self._schedule_preview)
+        self.cycle_len_input.valueChanged.connect(self._schedule_preview)
 
     # ---------- Data ----------
     def _frames_cache_key(self) -> tuple:
@@ -825,6 +829,11 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
     def _sync_preview(self):
         html = self._build_html()
         self.preview_browser.setHtml(html)
+
+    def _schedule_preview(self):
+        if self._preview_timer.isActive():
+            self._preview_timer.stop()
+        self._preview_timer.start()
 
     def _build_document(self) -> QtGui.QTextDocument:
         doc = QtGui.QTextDocument()

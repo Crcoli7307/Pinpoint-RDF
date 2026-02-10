@@ -176,7 +176,7 @@ def test_map_function_http_error(tmp_path, monkeypatch):
     history = {(10.0, 20.0): {"strength": 350, "quality": 0.9, "ts": 1}}
     output = tmp_path / "map.png"
     funcs.mapFunction(history, "token", logging.getLogger("test"), output_file=str(output))
-    assert not output.exists()
+    assert output.exists()
 
 
 def test_map_function_request_exception(tmp_path, monkeypatch):
@@ -187,7 +187,7 @@ def test_map_function_request_exception(tmp_path, monkeypatch):
     history = {(10.0, 20.0): {"strength": 350, "quality": 0.9, "ts": 1}}
     output = tmp_path / "map.png"
     funcs.mapFunction(history, "token", logging.getLogger("test"), output_file=str(output))
-    assert not output.exists()
+    assert output.exists()
 
 
 def test_find_gps_port_env_missing(monkeypatch):
