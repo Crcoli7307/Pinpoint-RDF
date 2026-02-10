@@ -31,6 +31,7 @@ htmlcov/
 
 # App outputs
 map.png
+calibration_profiles.json
 
 # Editors/OS
 .vscode/
