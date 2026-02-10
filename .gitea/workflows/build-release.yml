@@ -20,6 +20,7 @@ jobs:
           & $env:PYTHON_EXE -m pip --version
 
       - name: Install dependencies
+        shell: powershell
         run: |
           & $env:PYTHON_EXE -m pip install --upgrade pip
           & $env:PYTHON_EXE -m pip install -r requirements.txt
