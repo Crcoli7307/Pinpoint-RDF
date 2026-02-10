@@ -1,0 +1,48 @@
+﻿name: Build and Release (Windows)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build exe (PyInstaller)
+        shell: powershell
+        run: |
+          $cmd = Get-Content compile_command.txt -Raw
+          Write-Host "Running: $cmd"
+          cmd /c $cmd
+
+      - name: Verify build output
+        shell: powershell
+        run: |
+          if (-not (Test-Path "dist/Pinpoint.exe")) {
+            throw "Build output not found: dist/Pinpoint.exe"
+          }
+
+      - name: Create release and upload exe
+        uses: https://git.bjxgj.com/actions/gitea-release-action@v1
+        with:
+          tag_name: ci-${{ github.sha }}
+          target_commitish: ${{ github.sha }}
+          name: CI build ${{ github.sha }}
+          files: dist/Pinpoint.exe
+          server_url: ${{ github.server_url }}
+          repository: ${{ github.repository }}
+          token: ${{ secrets.GITEA_TOKEN }}
