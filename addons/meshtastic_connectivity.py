@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import inspect
+import logging
+import os
 import time
 from typing import Optional, Dict, Any, List
 
@@ -55,6 +57,24 @@ def _port_label(port: Dict[str, str]) -> str:
     return device
 
 
+def _is_permission_error(exc: Exception) -> bool:
+    if isinstance(exc, PermissionError):
+        return True
+    if getattr(exc, "errno", None) == 13:
+        return True
+    msg = str(exc).lower()
+    return "permission" in msg or "access is denied" in msg
+
+
+def _format_connect_error(port: str, exc: Exception) -> str:
+    if _is_permission_error(exc):
+        return (
+            f"Access denied opening {port}. "
+            "Close other apps using this port (Meshtastic app/CLI, GPS, serial monitor) and retry."
+        )
+    return f"Failed to connect to {port}: {exc}"
+
+
 class MeshtasticManager(QtCore.QObject):
     status_changed = QtCore.pyqtSignal(dict)
     message_received = QtCore.pyqtSignal(dict)
@@ -78,6 +98,14 @@ class MeshtasticManager(QtCore.QObject):
         self._handshake_timer = QtCore.QTimer(self)
         self._handshake_timer.setInterval(10_000)
         self._handshake_timer.timeout.connect(self._send_handshake)
+        self.connect_timeout_s = self._env_int("MESHTASTIC_CONNECT_TIMEOUT", 8)
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, default))
+        except Exception:
+            return default
 
     def library_available(self) -> bool:
         return SerialInterface is not None
@@ -93,11 +121,13 @@ class MeshtasticManager(QtCore.QObject):
         self.port = port
         self.baud = int(baud)
         try:
+            logging.getLogger(__name__).debug("Meshtastic connect requested: %s @ %s", port, self.baud)
             self.interface = self._create_interface(port, self.baud)
         except Exception as exc:  # pragma: no cover - serial errors
             self.interface = None
             self.connected = False
-            self.last_error = f"Failed to connect to {port}: {exc}"
+            self.last_error = _format_connect_error(port, exc)
+            logging.getLogger(__name__).warning("Meshtastic connect failed: %s", self.last_error)
             self._emit_status()
             return False
 
@@ -111,8 +141,9 @@ class MeshtasticManager(QtCore.QObject):
         return True
 
     def _create_interface(self, port: str, baud: int):
+        timeout_s = max(1, int(self.connect_timeout_s or 8))
         # Try a few common constructor signatures without ever passing baud positionally.
-        candidates = [
+        base_candidates = [
             {"port": port, "baud": baud},
             {"devPath": port, "baud": baud},
             {"device": port, "baud": baud},
@@ -125,6 +156,8 @@ class MeshtasticManager(QtCore.QObject):
             {"serial_port": port},
         ]
         sig = None
+        var_kw = False
+        params = set()
         try:
             sig = inspect.signature(SerialInterface.__init__)
         except Exception:
@@ -132,13 +165,42 @@ class MeshtasticManager(QtCore.QObject):
         if sig is not None:
             params = set(sig.parameters.keys())
             params.discard("self")
-            for cand in candidates:
-                if set(cand.keys()).issubset(params):
-                    try:
-                        return SerialInterface(**cand)
-                    except Exception:
-                        continue
+            var_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+
+        timeout_key = None
+        if var_kw:
+            timeout_key = "connectTimeout"
+        else:
+            for name in ("connectTimeout", "connect_timeout", "timeout"):
+                if name in params:
+                    timeout_key = name
+                    break
+
+        candidates = []
+        if timeout_key:
+            for cand in base_candidates:
+                cand_timeout = dict(cand)
+                cand_timeout[timeout_key] = timeout_s
+                candidates.append(cand_timeout)
+        candidates.extend(base_candidates)
+
+        last_exc = None
+        for cand in candidates:
+            if sig is not None and not var_kw:
+                if not set(cand.keys()).issubset(params):
+                    continue
+            try:
+                return SerialInterface(**cand)
+            except Exception as exc:
+                last_exc = exc
+                if _is_permission_error(exc):
+                    break
+                continue
         # Last resort: use the single positional device path only (avoid baud as positional debugOut).
+        if last_exc is not None and _is_permission_error(last_exc):
+            raise last_exc
         return SerialInterface(port)
 
     def disconnect(self) -> None:

@@ -1,5 +1,5 @@
 """
-PINPOINT Direction Finding v7.5.1
+PINPOINT Direction Finding v7.5.1-hotfix1
 """
 
 import os
@@ -539,7 +539,7 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 APP_TITLE = "PINPOINT Direction Finding"
-APP_VERSION = "v7.5.1"
+APP_VERSION = "v7.5.1-hotfix1"
 APP_ICON_PATH = _resource_path("app.ico")
 IMAGE_PATH = "map.png"
 PINPOINT_IMAGE_FALLBACK = _resource_path("pinpoint.png")  # used by Clear App
