@@ -1,5 +1,5 @@
 """
-PINPOINT Direction Finding v7.5.0+hotfix1 Tests and CI Update
+PINPOINT Direction Finding v7.5.0-hotfix2 Tests and CI Update
 """
 
 import os
@@ -436,7 +436,7 @@ _load_env_file(".env")
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
 
 APP_TITLE = "PINPOINT Direction Finding"
-APP_VERSION = "7.5.0+hotfix1"
+APP_VERSION = "v7.5.0-hotfix2"
 APP_ICON_PATH = _resource_path("app.ico")
 IMAGE_PATH = "map.png"
 PINPOINT_IMAGE_FALLBACK = _resource_path("pinpoint.png")  # used by Clear App

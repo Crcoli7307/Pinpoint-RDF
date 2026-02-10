@@ -27,8 +27,13 @@ jobs:
           if (-not $sha) { $sha = "${{ github.sha }}" }
           if (-not $sha) { $sha = (git rev-parse HEAD).Trim() }
           $short = if ($sha.Length -ge 8) { $sha.Substring(0, 8) } else { $sha }
-          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "tag=$version-$short" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          $tag = "$version-$short"
+          Write-Host "Resolved app version: $version"
+          Write-Host "Resolved release tag: $tag"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$version" -Encoding utf8
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag" -Encoding utf8
+          Add-Content -Path $env:GITHUB_ENV -Value "PINPOINT_VERSION=$version" -Encoding utf8
+          Add-Content -Path $env:GITHUB_ENV -Value "PINPOINT_VERSION_TAG=$tag" -Encoding utf8
 
       - name: Verify Python (preinstalled)
         shell: powershell
