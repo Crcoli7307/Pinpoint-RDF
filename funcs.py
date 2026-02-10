@@ -151,7 +151,7 @@ def predictTransmitterLocation(history, logger):
     return weighted_lat, weighted_lon
 
 
-def mapFunction(history, access_token, logger, output_file="map.png"):
+def mapFunction(history, access_token, logger, output_file="map.png", max_markers=None):
     """
     Create and save a static map with points colored based on the dictionary values.
     Also adds the predicted transmitter location in green.
@@ -173,6 +173,20 @@ def mapFunction(history, access_token, logger, output_file="map.png"):
         if isinstance(value, dict):
             return value.get("ts", 0)
         return 0
+
+    map_history = history
+    if max_markers is not None:
+        try:
+            max_markers = int(max_markers)
+        except Exception:
+            max_markers = None
+    if max_markers and len(history) > max_markers:
+        items = sorted(history.items(), key=lambda kv: _timestamp_from_value(kv[1]), reverse=True)
+        items = items[:max_markers]
+        map_history = {k: v for k, v in items}
+    if not map_history:
+        return
+    history = map_history
 
     strengths = [_strength_from_value(v) for v in history.values()]
     # Normalize intensity values to a 0-1 range for gradient mapping

@@ -51,12 +51,16 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
         self._settings = self._data.get("settings") or {}
         self._map_png_b64 = self._data.get("map_png_b64")
         self._start_time = self._parse_start_time(self._data.get("start_time"))
-        self._app_version = self._data.get("app_version") or "v7.5.0-hotfix4"
+        self._app_version = self._data.get("app_version") or "v7.5.0-hotfix5"
 
         self._primary_color = QtGui.QColor("#0f766e")
         self._accent_color = QtGui.QColor("#334155")
         self._logo_cache = {}
         self._map_cache = {}
+        self._stats_cache = None
+        self._stats_cache_key = None
+        self._cycles_cache = None
+        self._cycles_cache_key = None
 
         self._build_ui()
         self._sync_preview()
@@ -181,7 +185,21 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
         self.cycle_len_input.valueChanged.connect(self._sync_preview)
 
     # ---------- Data ----------
+    def _frames_cache_key(self) -> tuple:
+        if not self._frames:
+            return (0, None)
+        last_t = None
+        try:
+            last_t = self._frames[-1].get("t")
+        except Exception:
+            last_t = None
+        return (len(self._frames), last_t)
+
     def _collect_stats(self) -> Dict:
+        cache_key = self._frames_cache_key()
+        if self._stats_cache_key == cache_key and self._stats_cache is not None:
+            return self._stats_cache
+
         frames = self._frames
         strengths = []
         snrs = []
@@ -233,10 +251,16 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
                 "snr": _min_avg_max(data["snrs"]),
             }
 
-        return {"overall": overall, "per_ant": per_ant}
+        result = {"overall": overall, "per_ant": per_ant}
+        self._stats_cache_key = cache_key
+        self._stats_cache = result
+        return result
 
     def _collect_cycles(self) -> List[Dict]:
         cycle_len = max(1, int(self.cycle_len_input.value()))
+        cache_key = (self._frames_cache_key(), cycle_len)
+        if self._cycles_cache_key == cache_key and self._cycles_cache is not None:
+            return self._cycles_cache
         cycles: Dict[int, List[Dict]] = {}
         for frame in self._frames:
             t = frame.get("t", 0.0) or 0.0
@@ -268,6 +292,8 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
                     "samples": len(frames),
                 }
             )
+        self._cycles_cache_key = cache_key
+        self._cycles_cache = output
         return output
 
     def _infer_antenna_count(self) -> int:
@@ -888,244 +914,3 @@ def _resize_image_bytes(data: bytes, max_w: int, max_h: int) -> bytes:
             return out.getvalue()
     except Exception:
         return data
-    def _build_narrative_html(self) -> str:
-        if not self._frames:
-            return "<p>No telemetry data was captured for this session.</p>"
-
-        stats = self._collect_stats()
-        cycles = self._collect_cycles()
-        overall = stats.get("overall", {})
-        per_ant = stats.get("per_ant", {})
-
-        start_dt = self._start_time or datetime.datetime.now()
-        duration_s = 0.0
-        try:
-            duration_s = float(self._frames[-1].get("t", 0.0) or 0.0)
-        except Exception:
-            duration_s = 0.0
-        end_dt = start_dt + datetime.timedelta(seconds=duration_s)
-
-        freq = self._settings.get("frequency")
-        gain = self._settings.get("gain")
-        ctime = self._settings.get("collection_time")
-        antenna_count = self._infer_antenna_count() or len(per_ant) or 0
-        version_text = self.version_input.text().strip() or self._app_version
-
-        strength_min, strength_avg, strength_max = overall.get("strength", (None, None, None))
-        snr_min, snr_avg, snr_max = overall.get("snr", (None, None, None))
-        quality_min, quality_avg, quality_max = overall.get("quality", (None, None, None))
-        sats_avg = overall.get("sats_avg")
-        gps_fix_rate = overall.get("gps_fix_rate")
-
-        samples = len(self._frames)
-        cycle_len = max(1, int(self.cycle_len_input.value()))
-        cycle_count = len(cycles)
-
-        last_telemetry = self._frames[-1].get("telemetry", {}) if self._frames else {}
-        last_bearing = last_telemetry.get("target_bearing")
-        last_source = last_telemetry.get("bearing_source") or "--"
-        last_relative = last_telemetry.get("target_relative")
-
-        remarks = self.remarks_input.toPlainText().strip()
-        mission = self.mission_input.text().strip() or "this mission"
-
-        tz_label = self._tz_label(start_dt)
-        p1 = (
-            f"On {start_dt.strftime('%B %d, %Y')} at {start_dt.strftime('%H:%M')} hours ({tz_label}), "
-            f"the Pinpoint Direction-Finding Software {version_text} began collecting radio samples for {mission}. "
-            f"The system was configured at {freq:.3f} MHz" if freq else
-            f"On {start_dt.strftime('%B %d, %Y')} at {start_dt.strftime('%H:%M')} hours ({tz_label}), "
-            f"the Pinpoint Direction-Finding Software {version_text} began collecting radio samples for {mission}."
-        )
-        if freq:
-            extras = []
-            if gain is not None:
-                extras.append(f"gain set to {gain}")
-            if ctime is not None:
-                extras.append(f"a {ctime}s collection cadence")
-            if extras:
-                p1 += " with " + " and ".join(extras) + "."
-        if antenna_count:
-            p1 += f" The array used {antenna_count} antenna(s) during this session."
-
-        if remarks:
-            p1 += f" Mission purpose noted by the operator: {remarks}"
-
-        aoa_w = self._settings.get("fusion_aoa_weight")
-        map_w = self._settings.get("fusion_map_weight")
-        conf_th = self._settings.get("confidence_threshold")
-        p2 = (
-            "During operation, the software ingests samples from software-defined radios (SDRs), "
-            "computes relative signal strengths per antenna, and estimates an angle of arrival using a weighted vector method. "
-            "When GPS fixes are available, it calculates a map-based bearing from position history and fuses this with the RF estimate "
-            "using confidence weighting to provide a stabilized target bearing. "
-        )
-        weights = []
-        if aoa_w is not None:
-            weights.append(f"AoA weight {aoa_w}")
-        if map_w is not None:
-            weights.append(f"Map weight {map_w}")
-        if conf_th is not None:
-            weights.append(f"confidence threshold {conf_th}")
-        if weights:
-            p2 += "Fusion configuration: " + ", ".join(weights) + "."
-
-        duration_text = f"{duration_s/60.0:.1f} minutes" if duration_s >= 60 else f"{duration_s:.0f} seconds"
-        sdr_ok = 0
-        sdr_err = 0
-        for frame in self._frames:
-            tele = frame.get("telemetry") or {}
-            if tele.get("sdr_connected") is True:
-                sdr_ok += 1
-            if tele.get("sdr_error"):
-                sdr_err += 1
-        sdr_rate = (sdr_ok / samples) if samples else None
-
-        p3 = (
-            f"The session ran for approximately {duration_text}, producing {samples} samples across {cycle_count} cycle(s) "
-            f"with a cycle length of {cycle_len} seconds. "
-        )
-        if gps_fix_rate is not None:
-            p3 += f"GPS fix availability averaged {_fmt_num(gps_fix_rate * 100.0, 1)}%, "
-        if sats_avg is not None:
-            p3 += f"with an average of {_fmt_num(sats_avg, 1)} satellites in view. "
-        if sdr_rate is not None:
-            p3 += f"SDR connectivity was stable for {_fmt_num(sdr_rate * 100.0, 1)}% of samples"
-        if sdr_err:
-            p3 += f", with {sdr_err} logged SDR error event(s)."
-        else:
-            p3 += "."
-
-        p4 = (
-            f"Signal metrics observed during the mission included a maximum relative strength of {_fmt_num(strength_max, 1)}, "
-            f"a minimum of {_fmt_num(strength_min, 1)}, and an average of {_fmt_num(strength_avg, 1)}. "
-            f"SNR ranged from {_fmt_num(snr_min, 2)} to {_fmt_num(snr_max, 2)} with an average of {_fmt_num(snr_avg, 2)}. "
-            f"Overall quality measurements averaged {_fmt_num(quality_avg, 2)}."
-        )
-        if per_ant:
-            p4 += f" Per-antenna statistics were computed for {len(per_ant)} antenna(s), providing localized strength and SNR trends."
-
-        source_counts = {}
-        for frame in self._frames:
-            tele = frame.get("telemetry") or {}
-            src = tele.get("bearing_source")
-            if src:
-                source_counts[str(src).upper()] = source_counts.get(str(src).upper(), 0) + 1
-        dominant_source = None
-        if source_counts:
-            dominant_source = max(source_counts.items(), key=lambda x: x[1])[0]
-
-        if last_bearing is not None:
-            rel_text = "--" if last_relative is None else f"{last_relative:.0f} deg"
-            p5 = (
-                f"At the end of the session, the system reported a target bearing of {last_bearing:.0f} deg "
-                f"with a relative offset of {rel_text} and a source classification of {str(last_source).upper()}."
-            )
-        else:
-            p5 = (
-                "At the end of the session, the system did not report a stable target bearing; "
-                "operators are advised to consult detailed cycle data and per-antenna metrics for additional context."
-            )
-        if dominant_source:
-            p5 += f" The most frequently used bearing source during the mission was {dominant_source}."
-        if duration_s > 0:
-            p5 += f" Collection concluded at approximately {end_dt.strftime('%H:%M')} hours ({tz_label})."
-
-        return f"<p>{p1}</p><p>{p2}</p><p>{p3}</p><p>{p4}</p><p>{p5}</p>"
-
-    # ---------- Report ----------
-    def _build_html(self) -> str:
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        stats = self._collect_stats()
-        cycles = self._collect_cycles()
-
-        primary = self._primary_color.name()
-        accent = self._accent_color.name()
-
-        logo_html = ""
-        logo_b64 = self._get_logo_b64()
-        if logo_b64:
-            logo_html = f"<img class='logo' src='data:image/png;base64,{logo_b64}' />"
-
-        map_html = ""
-        map_b64 = self._get_map_b64()
-        if self.section_map.isChecked() and map_b64:
-            map_html = (
-                "<div class='section map-section block-keep'>"
-                "<div class='map-title section-title'>Map Snapshot</div>"
-                f"<div class='section-body map-wrap'><img class='map' width='680' src='data:image/png;base64,{map_b64}' /></div>"
-                "</div>"
-            )
-
-        overall = stats.get("overall", {})
-        overall_rows = ""
-        if self.section_overall.isChecked():
-            overall_rows = f"""
-            <tr><th>Signal Strength</th><td>{_fmt_num(overall.get("strength")[1], 1)}</td><td>{_fmt_num(overall.get("strength")[0], 1)}</td><td>{_fmt_num(overall.get("strength")[2], 1)}</td></tr>
-            <tr><th>SNR</th><td>{_fmt_num(overall.get("snr")[1], 2)}</td><td>{_fmt_num(overall.get("snr")[0], 2)}</td><td>{_fmt_num(overall.get("snr")[2], 2)}</td></tr>
-            <tr><th>Quality</th><td>{_fmt_num(overall.get("quality")[1], 2)}</td><td>{_fmt_num(overall.get("quality")[0], 2)}</td><td>{_fmt_num(overall.get("quality")[2], 2)}</td></tr>
-            """
-
-        gps_html = ""
-        if self.section_gps.isChecked():
-            gps_html = f"""
-            <div class='section block-keep'>
-              <h2 class='section-title'>GPS Summary</h2>
-              <div class='section-body'>
-                <p>Average satellites: {_fmt_num(overall.get("sats_avg"), 1)}<br/>
-                Fix rate: {_fmt_num((overall.get("gps_fix_rate") or 0) * 100.0, 1)}%</p>
-              </div>
-            </div>
-            """
-
-        per_ant_html = ""
-        if self.section_per_antenna.isChecked():
-            rows_list = []
-            for idx in sorted(stats.get("per_ant", {}).keys()):
-                vals = stats.get("per_ant", {}).get(idx, {})
-                strength = vals.get("strength", (None, None, None))
-                snr_vals = vals.get("snr", (None, None, None))
-                rows_list.append(
-                    "<tr>"
-                    f"<th>A{idx + 1}</th>"
-                    f"<td>{_fmt_num(strength[1], 1)}</td>"
-                    f"<td>{_fmt_num(strength[0], 1)}</td>"
-                    f"<td>{_fmt_num(strength[2], 1)}</td>"
-                    f"<td>{_fmt_num(snr_vals[1], 2)}</td>"
-                    f"<td>{_fmt_num(snr_vals[0], 2)}</td>"
-                    f"<td>{_fmt_num(snr_vals[2], 2)}</td>"
-                    "</tr>"
-                )
-            if not rows_list:
-                per_ant_html = """
-                <div class='section block-keep'>
-                  <h2 class='section-title'>Per-Antenna Stats</h2>
-                  <div class='section-body'>
-                    <table>
-                      <tr><th>Antenna</th><th>Strength Avg</th><th>Strength Min</th><th>Strength Max</th><th>SNR Avg</th><th>SNR Min</th><th>SNR Max</th></tr>
-                      <tr><td colspan='7'>No antenna data captured.</td></tr>
-                    </table>
-                  </div>
-                </div>
-                """
-            else:
-                chunks = _chunk_list(rows_list, 12)
-                parts = []
-                for i, chunk in enumerate(chunks):
-                    title = "Per-Antenna Stats" if i == 0 else "Per-Antenna Stats (cont.)"
-                    page_break = "" if i == 0 else "<div class='page-break'></div>"
-                    parts.append(
-                        f"""
-                        {page_break}
-                        <div class='section block-keep'>
-                          <h2 class='section-title'>{title}</h2>
-                          <div class='section-body'>
-                            <table>
-                              <tr><th>Antenna</th><th>Strength Avg</th><th>Strength Min</th><th>Strength Max</th><th>SNR Avg</th><th>SNR Min</th><th>SNR Max</th></tr>
-                              {''.join(chunk)}
-                            </table>
-                          </div>
-                        </div>
-                        """
-                    )
-                per_ant_html = "".join(parts)

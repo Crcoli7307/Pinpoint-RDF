@@ -1,5 +1,5 @@
 """
-PINPOINT Direction Finding v7.5.0-hotfix4 Tests and CI Update
+PINPOINT Direction Finding v7.5.0-hotfix5
 """
 
 import os
@@ -14,6 +14,7 @@ import hashlib
 import tempfile
 import base64
 import datetime
+import multiprocessing
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -186,6 +187,46 @@ _ensure_librtlsdr_windows()
 
 # Your data pipeline
 import funcs
+
+def _hardware_check_worker(out_q) -> None:
+    try:
+        has_sdr = bool(funcs.list_sdr_devices())
+    except Exception:
+        has_sdr = False
+    try:
+        has_gps = _detect_gps_nmea_present()
+    except Exception:
+        has_gps = False
+    try:
+        out_q.put((has_sdr, has_gps))
+    except Exception:
+        pass
+
+
+def _calibration_worker(index: int, frequency_mhz: float, gain: int, sample_seconds: float, out_q) -> None:
+    radio = None
+    try:
+        radio = funcs.selectRadio(index)
+        radio.center_freq = frequency_mhz * 1e6
+        radio.sample_rate = SDR_DEFAULT_SAMPLE_RATE
+        radio.gain = gain
+        sample_count = int(max(1, sample_seconds * radio.sample_rate))
+        samples = radio.read_samples(sample_count)
+        processed = np.abs(samples)
+        mean_val = float(np.mean(processed)) if len(processed) else 0.0
+        strength = int(np.clip(mean_val * 1000, 1, 1000))
+        out_q.put({"strength": strength})
+    except Exception as e:
+        try:
+            out_q.put({"error": str(e)})
+        except Exception:
+            pass
+    finally:
+        try:
+            if radio is not None:
+                radio.close()
+        except Exception:
+            pass
 
 def _transparentize_gif(src_path: str, allow_processing: bool = True) -> str:
     """
@@ -444,8 +485,20 @@ def _get_mapbox_token() -> Optional[str]:
     token = token.strip()
     return token if token else None
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except Exception:
+        return default
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except Exception:
+        return default
+
 APP_TITLE = "PINPOINT Direction Finding"
-APP_VERSION = "v7.5.0-hotfix4"
+APP_VERSION = "v7.5.0-hotfix5"
 APP_ICON_PATH = _resource_path("app.ico")
 IMAGE_PATH = "map.png"
 PINPOINT_IMAGE_FALLBACK = _resource_path("pinpoint.png")  # used by Clear App
@@ -453,8 +506,15 @@ LOG_FILE = "main.log"
 MAX_WIDTH = 800
 MAX_HEIGHT = 600
 MAP_UPDATE_INTERVAL_S = 3.0
+HISTORY_MAX_POINTS = _env_int("HISTORY_MAX_POINTS", 150)
+HISTORY_MAX_AGE_S = _env_float("HISTORY_MAX_AGE_S", 3600.0)
+REPORT_CACHE_MAX_FRAMES = _env_int("REPORT_CACHE_MAX_FRAMES", 5000)
 GPS_MAX_WAIT_S = 10
 SDR_SCAN_INTERVAL_S = 5.0
+SDR_DEFAULT_SAMPLE_RATE = 2.048e6
+HARDWARE_CHECK_TIMEOUT_S = 6.0
+CALIBRATION_SAMPLE_SECONDS = 0.5
+CALIBRATION_TIMEOUT_S = 8.0
 CALIBRATION_FILE = "calibration_profiles.json"
 LOADING_ANIM_GENERAL = _resource_path("assets", "gifs", "general.gif")
 LOADING_ANIM_CHECKING = _resource_path("assets", "gifs", "checking.gif")
@@ -717,6 +777,29 @@ def _map_confidence(history: dict) -> float:
     avg_strength = float(np.mean(strengths))
     strength_factor = min(1.0, avg_strength / 300.0)
     return max(0.0, min(1.0, 0.6 * count_factor + 0.4 * strength_factor))
+
+
+def _prune_history(history: dict, now: float) -> None:
+    if not history:
+        return
+    max_age = HISTORY_MAX_AGE_S
+    if max_age and max_age > 0:
+        cutoff = now - max_age
+        stale_keys = [
+            k for k, v in history.items()
+            if isinstance(v, dict) and (v.get("ts") or 0) < cutoff
+        ]
+        for k in stale_keys:
+            history.pop(k, None)
+    max_points = HISTORY_MAX_POINTS
+    if max_points and max_points > 0 and len(history) > max_points:
+        items = sorted(
+            history.items(),
+            key=lambda kv: (kv[1].get("ts") if isinstance(kv[1], dict) else 0) or 0,
+        )
+        for k, _ in items[:-max_points]:
+            history.pop(k, None)
+
 
 
 def _fuse_bearings(bearings_with_weight: list[tuple[Optional[float], float]]) -> tuple[Optional[float], float]:
@@ -1057,13 +1140,14 @@ class CollectorThread(QtCore.QThread):
                             "snr": quality.get("snr", 0.0),
                             "ts": ts,
                         }
+                        _prune_history(history, ts)
                     # Update map using token from environment or settings override. Skip update if token missing.
                     token = _get_mapbox_token()
                     if token and history:
                         now = time.time()
                         if now - last_map_update >= MAP_UPDATE_INTERVAL_S:
                             try:
-                                funcs.mapFunction(history, token, self.logger)
+                                funcs.mapFunction(history, token, self.logger, max_markers=HISTORY_MAX_POINTS)
                                 last_map_update = now
                             except Exception:
                                 # Ensure map errors don't kill the record loop and include traceback
@@ -2533,14 +2617,23 @@ class HardwareCheckThread(QtCore.QThread):
     result = QtCore.pyqtSignal(bool, bool)
 
     def run(self):
-        try:
-            has_sdr = bool(funcs.list_sdr_devices())
-        except Exception:
-            has_sdr = False
-        try:
-            has_gps = _detect_gps_nmea_present()
-        except Exception:
-            has_gps = False
+        has_sdr = False
+        has_gps = False
+        ctx = multiprocessing.get_context("spawn")
+        queue = ctx.Queue()
+        proc = ctx.Process(target=_hardware_check_worker, args=(queue,))
+        proc.daemon = True
+        proc.start()
+        proc.join(HARDWARE_CHECK_TIMEOUT_S)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(1)
+        else:
+            try:
+                has_sdr, has_gps = queue.get_nowait()
+            except Exception:
+                has_sdr = False
+                has_gps = False
         self.result.emit(has_sdr, has_gps)
 
 
@@ -2831,6 +2924,7 @@ class CalibrationThread(QtCore.QThread):
             return
 
         baseline_strengths = {}
+        ctx = multiprocessing.get_context("spawn")
         for idx, dev in enumerate(devices, start=1):
             serial_val = dev.get("serial")
             if serial_val:
@@ -2838,38 +2932,48 @@ class CalibrationThread(QtCore.QThread):
             else:
                 serial_text = str(dev.get("index") if dev.get("index") is not None else idx)
             self.progress.emit(idx - 1, total, f"Calibrating SDR #{serial_text}...")
-            radio = None
             key = _device_key(dev.get("index"), dev.get("serial"))
+            strength = None
+            error_text = None
             try:
-                radio = funcs.selectRadio(dev["index"])
-                radio.center_freq = self.frequency_mhz * 1e6
-                radio.sample_rate = 2.048e6
-                radio.gain = self.gain
-                sample_count = int(0.5 * radio.sample_rate)
-                samples = radio.read_samples(sample_count)
-                processed = np.abs(samples)
-                mean_val = float(np.mean(processed)) if len(processed) else 0.0
-                strength = int(np.clip(mean_val * 1000, 1, 1000))
+                queue = ctx.Queue()
+                proc = ctx.Process(
+                    target=_calibration_worker,
+                    args=(dev.get("index"), self.frequency_mhz, self.gain, CALIBRATION_SAMPLE_SECONDS, queue),
+                )
+                proc.daemon = True
+                proc.start()
+                proc.join(CALIBRATION_TIMEOUT_S)
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(1)
+                    error_text = f"Calibration timed out after {CALIBRATION_TIMEOUT_S:.0f}s"
+                else:
+                    try:
+                        result = queue.get_nowait()
+                    except Exception:
+                        result = {"error": "No calibration data returned."}
+                    if isinstance(result, dict) and result.get("error"):
+                        error_text = result.get("error")
+                    else:
+                        strength = result.get("strength") if isinstance(result, dict) else None
+            except Exception as e:
+                error_text = str(e)
+            if strength is not None:
                 baseline_strengths[key] = strength
                 calibration[key] = {
                     "offset": strength,
                     "scale": 1.0,
                     "baseline": strength,
                 }
-            except Exception as e:
+            else:
                 fallback = existing_profile.get(key, {})
                 calibration[key] = {
                     "offset": fallback.get("offset", 0),
                     "scale": fallback.get("scale", 1.0),
                     "baseline": fallback.get("baseline"),
-                    "error": str(e),
+                    "error": error_text or "Calibration failed.",
                 }
-            finally:
-                try:
-                    if radio is not None:
-                        radio.close()
-                except Exception:
-                    pass
             self.progress.emit(idx, total, f"Calibrated SDR #{serial_text}")
 
         # Normalize scales to the median baseline strength
@@ -3719,6 +3823,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.report_cache_started_at = time.time()
         t = time.time() - self.report_cache_started_at
         self.report_cache_frames.append({"t": round(t, 3), "telemetry": telemetry})
+        max_frames = REPORT_CACHE_MAX_FRAMES
+        if max_frames and max_frames > 0 and len(self.report_cache_frames) > max_frames:
+            self.report_cache_frames = self.report_cache_frames[-max_frames:]
 
     def _refresh_report_action(self):
         available = bool(self.report_cache_frames) and not self.collecting
@@ -4238,6 +4345,10 @@ class MainWindow(QtWidgets.QMainWindow):
 # App bootstrap
 # ---------------------------
 def main():
+    try:
+        multiprocessing.freeze_support()
+    except Exception:
+        pass
     # High-DPI awareness (set before creating the app)
     try:
         if hasattr(QtCore.Qt.ApplicationAttribute, "AA_EnableHighDpiScaling"):
