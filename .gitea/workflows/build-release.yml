@@ -1,4 +1,4 @@
-﻿name: Build and Release (Windows)
+name: Build and Release (Windows)
 
 on:
   push:
@@ -9,7 +9,7 @@ jobs:
   build-release:
     runs-on: windows-latest
     env:
-      PYTHON_EXE: 'C:\Users\Administrator\.cache\act\tool_cache\Python\3.11.9\x64\python.exe'
+      PYTHON_EXE: 'C:\Users\Administrator\AppData\Local\Programs\Python\Python311\python.exe'
     steps:
       - uses: actions/checkout@v4
 
