@@ -13,6 +13,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Read app version
+        shell: powershell
+        run: |
+          $content = Get-Content main.py -Raw
+          if ($content -match 'APP_VERSION\s*=\s*"([^"]+)"') {
+            $version = $matches[1]
+          } else {
+            throw "APP_VERSION not found in main.py"
+          }
+          $sha = $env:GITHUB_SHA
+          if (-not $sha) {
+            throw "GITHUB_SHA not set"
+          }
+          $short = if ($sha.Length -ge 8) { $sha.Substring(0, 8) } else { $sha }
+          "PINPOINT_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PINPOINT_VERSION_TAG=$version+$short" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Verify Python (preinstalled)
         shell: powershell
         run: |
@@ -68,9 +85,9 @@ jobs:
       - name: Create release and upload exe
         uses: https://git.bjxgj.com/actions/gitea-release-action@v1
         with:
-          tag_name: ci-${{ github.sha }}
+          tag_name: ${{ env.PINPOINT_VERSION_TAG }}
           target_commitish: ${{ github.sha }}
-          name: CI build ${{ github.sha }}
+          name: Pinpoint ${{ env.PINPOINT_VERSION }}
           files: dist/Pinpoint.exe
           server_url: ${{ github.server_url }}
           repository: ${{ github.repository }}

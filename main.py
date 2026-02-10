@@ -1,5 +1,5 @@
 """
-PINPOINT Direction Finding v7.4.0 Tests and CI Update
+PINPOINT Direction Finding v7.5.0 Tests and CI Update
 """
 
 import os
@@ -71,6 +71,16 @@ def _is_bundled() -> bool:
     if "__compiled__" in globals():
         return True
     return False
+
+
+def _resource_path(*parts: str) -> str:
+    """
+    Resolve a resource path that works both in dev and bundled (PyInstaller) builds.
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    if not base:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, *parts)
 
 
 def _ensure_librtlsdr_windows() -> None:
@@ -426,10 +436,10 @@ _load_env_file(".env")
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
 
 APP_TITLE = "PINPOINT Direction Finding"
-APP_VERSION = "v7"
-APP_ICON_PATH = "app.ico"
+APP_VERSION = "v7.5.0"
+APP_ICON_PATH = _resource_path("app.ico")
 IMAGE_PATH = "map.png"
-PINPOINT_IMAGE_FALLBACK = "pinpoint.png"  # used by Clear App
+PINPOINT_IMAGE_FALLBACK = _resource_path("pinpoint.png")  # used by Clear App
 LOG_FILE = "main.log"
 MAX_WIDTH = 800
 MAX_HEIGHT = 600
@@ -437,18 +447,18 @@ MAP_UPDATE_INTERVAL_S = 3.0
 GPS_MAX_WAIT_S = 10
 SDR_SCAN_INTERVAL_S = 5.0
 CALIBRATION_FILE = "calibration_profiles.json"
-LOADING_ANIM_GENERAL = os.path.join("assets", "gifs", "general.gif")
-LOADING_ANIM_CHECKING = os.path.join("assets", "gifs", "checking.gif")
-LOADING_ANIM_CAL = os.path.join("assets", "gifs", "calibrating.gif")
-LOADING_ANIM_GPS = os.path.join("assets", "gifs", "gps_search.gif")
-LOADING_ANIM_STOP = os.path.join("assets", "gifs", "stopping.gif")
-LOADING_ANIM_START = os.path.join("assets", "gifs", "starting.gif")
-LOADING_ANIM_RUNNING = os.path.join("assets", "gifs", "running.gif")
-QUESTION_GIF = os.path.join("assets", "gifs", "question.gif")
-LOADING_ANIM_PLAYBACK = os.path.join("assets", "gifs", "playback.gif")
-LOADING_ANIM_PAUSED = os.path.join("assets", "gifs", "paused.gif")
-ALERT_GIF = os.path.join("assets", "gifs", "alert.gif")
-LOADING_ANIM_IMPORT = os.path.join("assets", "gifs", "import_file.gif")
+LOADING_ANIM_GENERAL = _resource_path("assets", "gifs", "general.gif")
+LOADING_ANIM_CHECKING = _resource_path("assets", "gifs", "checking.gif")
+LOADING_ANIM_CAL = _resource_path("assets", "gifs", "calibrating.gif")
+LOADING_ANIM_GPS = _resource_path("assets", "gifs", "gps_search.gif")
+LOADING_ANIM_STOP = _resource_path("assets", "gifs", "stopping.gif")
+LOADING_ANIM_START = _resource_path("assets", "gifs", "starting.gif")
+LOADING_ANIM_RUNNING = _resource_path("assets", "gifs", "running.gif")
+QUESTION_GIF = _resource_path("assets", "gifs", "question.gif")
+LOADING_ANIM_PLAYBACK = _resource_path("assets", "gifs", "playback.gif")
+LOADING_ANIM_PAUSED = _resource_path("assets", "gifs", "paused.gif")
+ALERT_GIF = _resource_path("assets", "gifs", "alert.gif")
+LOADING_ANIM_IMPORT = _resource_path("assets", "gifs", "import_file.gif")
 LOADING_ICON_PX = 64
 GIF_WHITE_THRESHOLD = 245
 GIF_TRANSPARENT_KEY = (255, 0, 255)
