@@ -1,0 +1,24 @@
+{
+  "default": {
+    "serial:1": {
+      "offset": 63,
+      "scale": 0.7301587301587301,
+      "baseline": 63
+    },
+    "serial:2": {
+      "offset": 48,
+      "scale": 0.9583333333333334,
+      "baseline": 48
+    },
+    "serial:3": {
+      "offset": 44,
+      "scale": 1.0454545454545454,
+      "baseline": 44
+    },
+    "serial:4": {
+      "offset": 44,
+      "scale": 1.0454545454545454,
+      "baseline": 44
+    }
+  }
+}

@@ -1,0 +1,10 @@
+PyQt6
+Pillow
+colorlog
+numpy
+pyrtlsdr
+pynmea2
+pyserial
+requests
+psutil
+meshtastic
