@@ -30,6 +30,29 @@ jobs:
         shell: powershell
         run: |
           $cmd = Get-Content compile_command.txt -Raw
+          # Drop --add-data entries for gitignored or missing sources.
+          $cmd = [regex]::Replace($cmd, '--add-data\s+"([^"]+)"', {
+            param($m)
+            $pair = $m.Groups[1].Value
+            $src = $pair.Split(';', 2)[0]
+            $ignored = $false
+            try {
+              git check-ignore -q -- $src
+              if ($LASTEXITCODE -eq 0) { $ignored = $true }
+            } catch {
+              $ignored = $false
+            }
+            if ($ignored) {
+              Write-Host "Skipping gitignored data: $src"
+              return ''
+            }
+            if (-not (Test-Path $src)) {
+              Write-Host "Skipping missing data: $src"
+              return ''
+            }
+            return $m.Value
+          })
+          $cmd = $cmd -replace '\s{2,}', ' '
           $py = $env:PYTHON_EXE
           $cmd = $cmd -replace '^\s*pyinstaller\b', "`"$py`" -m PyInstaller"
           Write-Host "Running: $cmd"
