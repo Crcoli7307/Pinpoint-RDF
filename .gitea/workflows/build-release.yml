@@ -17,11 +17,15 @@ jobs:
         id: app_version
         shell: powershell
         run: |
-          $content = Get-Content main.py -Raw
-          if ($content -match 'APP_VERSION\s*=\s*"([^"]+)"') {
+          $versionFile = "pinpoint/version.py"
+          if (-not (Test-Path $versionFile)) {
+            $versionFile = "main.py"
+          }
+          $content = Get-Content $versionFile -Raw
+          if ($content -match "APP_VERSION\s*=\s*["'\"]([^"'\"]+)["'\"]") {
             $version = $matches[1]
           } else {
-            throw "APP_VERSION not found in main.py"
+            throw "APP_VERSION not found in $versionFile"
           }
           $sha = $env:GITHUB_SHA
           if (-not $sha) { $sha = "${{ github.sha }}" }
