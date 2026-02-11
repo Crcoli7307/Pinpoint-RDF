@@ -1793,8 +1793,7 @@ class GPSStartupDialog(QtWidgets.QDialog):
 
         asset = _status_anim_for_mode(mode)
         if asset and os.path.exists(asset):
-            # Avoid heavy GIF processing during startup to keep UI responsive.
-            processed_asset = _transparentize_gif(asset, allow_processing=False)
+            processed_asset = _transparentize_gif(asset, allow_processing=True)
             movie = QtGui.QMovie(processed_asset)
             if movie.isValid():
                 movie.setScaledSize(QtCore.QSize(LOADING_ICON_PX, LOADING_ICON_PX))
