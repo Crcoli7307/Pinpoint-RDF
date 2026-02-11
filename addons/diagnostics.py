@@ -1,4 +1,15 @@
-"""Diagnostics and troubleshooting add-on."""
+"""
+PINPOINT Software Project
+addons/diagnostics.py
+Copyright 2026 Crayton Litton. Public Domain.
+MIT License
+---
+Implements the Diagnostics add-on dialog with system, settings, and device checks.
+Wires menu actions to open the dialog and emit test events.
+---
+
+https://nexus.crayton.dev/
+"""
 from __future__ import annotations
 
 import os

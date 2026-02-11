@@ -1,4 +1,15 @@
-"""Static map rendering and prediction helpers."""
+"""
+PINPOINT Software Project
+funcs/map.py
+Copyright 2026 Crayton Litton. Public Domain.
+MIT License
+---
+Provides mapping helpers to predict transmitter location and render static maps.
+Supports offline rendering and Mapbox-backed map generation.
+---
+
+https://nexus.crayton.dev/
+"""
 
 import logging
 from io import BytesIO

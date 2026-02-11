@@ -1,4 +1,15 @@
-"""Core configuration, utilities, and shared state."""
+"""
+PINPOINT Software Project
+pinpoint/core.py
+Copyright 2026 Crayton Litton. Public Domain.
+MIT License
+---
+Holds core configuration, shared state, and utility functions for Pinpoint.
+Provides settings, logging, resource paths, and hardware/data helpers used across the app.
+---
+
+https://nexus.crayton.dev/
+"""
 
 import os
 import sys
@@ -7,6 +18,7 @@ import time
 import threading
 import logging
 import math
+import random
 import json
 import hashlib
 import tempfile
@@ -915,6 +927,286 @@ def _save_calibration_profiles(data: dict) -> None:
 # ---------------------------
 # Worker Thread for Data Collection
 # ---------------------------
+DEMO_DEFAULTS = {
+    "center_lat": 37.7749,
+    "center_lon": -122.4194,
+    "radius_m": 250.0,
+    "speed_mps": 6.0,
+    "target_bearing_deg": 45.0,
+    "target_distance_m": 180.0,
+    "antenna_count": 4,
+    "update_interval_s": 0.0,
+    "satellite_count": 9,
+    "signal_noise": 0.08,
+    "seed": 1337,
+}
+
+
+class DemoCollectorThread(QtCore.QThread):
+    """Simulated data collection loop for demo mode."""
+
+    status = QtCore.pyqtSignal(str)
+    error = QtCore.pyqtSignal(str)
+    telemetry = QtCore.pyqtSignal(dict)
+
+    def __init__(self, logger: logging.Logger, stop_event: threading.Event, config: Optional[dict] = None, parent=None):
+        super().__init__(parent)
+        self.logger = logger
+        self.stop_event = stop_event
+        self.config = dict(DEMO_DEFAULTS)
+        if isinstance(config, dict):
+            self.config.update({k: v for k, v in config.items() if v is not None})
+        seed = self._cfg_int("seed", DEMO_DEFAULTS["seed"])
+        self._rng = random.Random(seed)
+
+    def _cfg_float(self, key: str, default: float) -> float:
+        try:
+            return float(self.config.get(key, default))
+        except Exception:
+            return float(default)
+
+    def _cfg_int(self, key: str, default: int) -> int:
+        try:
+            return int(self.config.get(key, default))
+        except Exception:
+            return int(default)
+
+    def _offset_lat_lon(self, lat: float, lon: float, distance_m: float, angle_rad: float) -> tuple[float, float]:
+        meters_per_deg_lat = 111_320.0
+        meters_per_deg_lon = 111_320.0 * math.cos(math.radians(lat))
+        dlat = (distance_m * math.cos(angle_rad)) / meters_per_deg_lat
+        dlon = 0.0
+        if meters_per_deg_lon != 0.0:
+            dlon = (distance_m * math.sin(angle_rad)) / meters_per_deg_lon
+        return lat + dlat, lon + dlon
+
+    def _approx_distance_m(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        meters_per_deg_lat = 111_320.0
+        meters_per_deg_lon = 111_320.0 * math.cos(math.radians((lat1 + lat2) * 0.5))
+        dlat_m = (lat2 - lat1) * meters_per_deg_lat
+        dlon_m = (lon2 - lon1) * meters_per_deg_lon
+        return math.hypot(dlat_m, dlon_m)
+
+    def _build_satellites(self, count: int) -> list[dict]:
+        sats = []
+        for idx in range(max(0, int(count))):
+            sats.append(
+                {
+                    "prn": str(idx + 1),
+                    "elevation": round(self._rng.uniform(10.0, 85.0), 1),
+                    "azimuth": round(self._rng.uniform(0.0, 359.0), 1),
+                    "snr": round(self._rng.uniform(20.0, 45.0), 1),
+                }
+            )
+        return sats
+
+    def run(self):
+        history = {}
+        last_map_update = 0.0
+        last_fix = None
+        last_fix_time = None
+        last_satellites = []
+        last_sat_update = 0.0
+        start_time = time.time()
+        start_angle_deg = self._cfg_float("start_angle_deg", self._rng.uniform(0.0, 360.0))
+        self.logger.info("Demo collector thread started.")
+        try:
+            while not self.stop_event.is_set():
+                now = time.time()
+                with settings_lock:
+                    s = settings.to_dict()
+                freq_mhz = s.get("frequency")
+                spacing_in = s.get("antenna_spacing_in", 0.0)
+                base_interval = float(s.get("collection_time") or 1.0)
+                update_interval = self._cfg_float("update_interval_s", 0.0)
+                if update_interval <= 0:
+                    update_interval = max(0.25, base_interval)
+
+                center_lat = self._cfg_float("center_lat", DEMO_DEFAULTS["center_lat"])
+                center_lon = self._cfg_float("center_lon", DEMO_DEFAULTS["center_lon"])
+                radius_m = max(10.0, self._cfg_float("radius_m", DEMO_DEFAULTS["radius_m"]))
+                speed_mps = max(0.5, self._cfg_float("speed_mps", DEMO_DEFAULTS["speed_mps"]))
+                target_bearing_deg = self._cfg_float("target_bearing_deg", DEMO_DEFAULTS["target_bearing_deg"])
+                target_distance_m = max(10.0, self._cfg_float("target_distance_m", DEMO_DEFAULTS["target_distance_m"]))
+                antenna_count = max(1, self._cfg_int("antenna_count", int(s.get("antenna_count") or 1)))
+                satellite_count = max(4, self._cfg_int("satellite_count", DEMO_DEFAULTS["satellite_count"]))
+                noise = max(0.0, min(0.5, self._cfg_float("signal_noise", DEMO_DEFAULTS["signal_noise"])))
+
+                # Movement along a circular path
+                elapsed = now - start_time
+                angular_speed = speed_mps / max(radius_m, 1.0)
+                angle = math.radians(start_angle_deg) + angular_speed * elapsed
+                lat, lon = self._offset_lat_lon(center_lat, center_lon, radius_m, angle)
+
+                current_bearing = None
+                if last_fix is not None:
+                    current_bearing = _bearing_deg(last_fix[0], last_fix[1], lat, lon)
+                last_fix = (lat, lon)
+                last_fix_time = now
+
+                target_angle = math.radians(target_bearing_deg)
+                target_lat, target_lon = self._offset_lat_lon(center_lat, center_lon, target_distance_m, target_angle)
+                target_bearing = _bearing_deg(lat, lon, target_lat, target_lon)
+                target_relative = _relative_bearing(target_bearing, current_bearing)
+
+                dist_m = self._approx_distance_m(lat, lon, target_lat, target_lon)
+                base_strength = 1000.0 / (1.0 + (dist_m / 120.0) ** 2)
+                strength = int(max(1, min(1000, base_strength + self._rng.uniform(-30.0, 30.0))))
+                snr = max(0.1, 5.0 + (strength / 1000.0) * 20.0 + self._rng.uniform(-1.5, 1.5))
+                quality = max(0.0, min(1.0, (strength / 1000.0) + self._rng.uniform(-noise, noise)))
+
+                if now - last_sat_update >= 5.0 or not last_satellites:
+                    last_satellites = self._build_satellites(satellite_count)
+                    last_sat_update = now
+
+                # Simulate per-antenna strengths
+                angles = _antenna_angles(antenna_count)
+                rel_for_calc = target_relative if target_relative is not None else 0.0
+                strengths = []
+                antenna_states = []
+                for idx, angle_deg in enumerate(angles):
+                    diff = math.radians((angle_deg - rel_for_calc) % 360.0)
+                    directional = max(0.05, math.cos(diff))
+                    ant_strength = max(
+                        1,
+                        int(strength * (0.4 + 0.6 * directional) + self._rng.uniform(-15.0, 15.0)),
+                    )
+                    strengths.append(ant_strength)
+                    antenna_states.append(
+                        {
+                            "index": idx,
+                            "name": "Demo SDR",
+                            "serial": f"DEMO-{idx + 1:02d}",
+                            "connected": True,
+                            "error": None,
+                            "sample_rate": 2.048e6,
+                            "strength": ant_strength,
+                            "snr": snr,
+                            "quality": quality,
+                        }
+                    )
+
+                aoa_relative, aoa_confidence = _aoa_from_strengths(strengths, angles)
+                aoa_confidence *= _spacing_factor(freq_mhz, spacing_in)
+                aoa_bearing = None
+                if aoa_relative is not None and current_bearing is not None:
+                    aoa_bearing = _normalize_bearing(current_bearing + aoa_relative)
+
+                history[(lat, lon)] = {
+                    "strength": strength,
+                    "quality": quality,
+                    "snr": snr,
+                    "ts": now,
+                }
+                _prune_history(history, now)
+
+                # Update map image
+                if history:
+                    if now - last_map_update >= MAP_UPDATE_INTERVAL_S:
+                        try:
+                            funcs.mapFunction(
+                                history,
+                                _get_mapbox_token(),
+                                self.logger,
+                                max_markers=HISTORY_MAX_POINTS,
+                                max_url_len=MAPBOX_URL_MAX,
+                            )
+                            last_map_update = now
+                        except Exception:
+                            self.logger.exception("Error while updating demo map")
+
+                map_target_bearing = None
+                map_confidence = _map_confidence(history)
+                target_loc = _estimate_target_from_history(history)
+                if target_loc:
+                    map_target_bearing = _bearing_deg(lat, lon, target_loc[0], target_loc[1])
+
+                with settings_lock:
+                    aoa_w = float(settings.fusion_aoa_weight)
+                    map_w = float(settings.fusion_map_weight)
+                    conf_threshold = float(settings.confidence_threshold)
+                    auto_tune = bool(getattr(settings, "auto_tune_fusion", False))
+                if auto_tune:
+                    aoa_factor = 0.5 + 0.5 * (aoa_confidence or 0.0)
+                    map_factor = 0.5 + 0.5 * (map_confidence or 0.0)
+                    if last_fix is None:
+                        map_factor *= 0.1
+                    aoa_w *= aoa_factor
+                    map_w *= map_factor
+                    conf_threshold = max(0.05, min(0.95, conf_threshold * (1.1 - 0.6 * float(quality))))
+                weight_total = max(1e-6, aoa_w + map_w)
+                aoa_w /= weight_total
+                map_w /= weight_total
+
+                fused_bearing, fusion_confidence = _fuse_bearings(
+                    [
+                        (aoa_bearing, aoa_w * aoa_confidence),
+                        (map_target_bearing, map_w * map_confidence),
+                    ]
+                )
+
+                bearing_source = None
+                target_bearing_out = None
+                target_relative_out = None
+
+                if fused_bearing is not None and fusion_confidence >= conf_threshold:
+                    target_bearing_out = fused_bearing
+                    bearing_source = "fused"
+                elif aoa_bearing is not None and aoa_confidence >= conf_threshold:
+                    target_bearing_out = aoa_bearing
+                    bearing_source = "aoa"
+                elif map_target_bearing is not None and map_confidence >= conf_threshold:
+                    target_bearing_out = map_target_bearing
+                    bearing_source = "map"
+                else:
+                    if aoa_bearing is not None:
+                        target_bearing_out = aoa_bearing
+                        bearing_source = "aoa"
+                    else:
+                        target_bearing_out = map_target_bearing
+                        bearing_source = "map" if map_target_bearing is not None else None
+
+                target_relative_out = _relative_bearing(target_bearing_out, current_bearing)
+
+                fix_age = None if last_fix_time is None else max(0.0, now - last_fix_time)
+                self.telemetry.emit(
+                    {
+                        "gps_fix": True,
+                        "gps_loc": (lat, lon),
+                        "sats": len(last_satellites),
+                        "fix_age_s": fix_age,
+                        "strength": strength,
+                        "snr": snr,
+                        "quality": quality,
+                        "satellites": last_satellites,
+                        "sdr_connected": True,
+                        "sdr_error": None,
+                        "sdr_sample_rate": 2.048e6,
+                        "antenna_count": antenna_count,
+                        "antenna_states": antenna_states,
+                        "current_bearing": current_bearing,
+                        "target_bearing": target_bearing_out,
+                        "target_relative": target_relative_out,
+                        "aoa_bearing": aoa_bearing,
+                        "aoa_relative": aoa_relative,
+                        "aoa_confidence": aoa_confidence,
+                        "map_target_bearing": map_target_bearing,
+                        "map_confidence": map_confidence,
+                        "fusion_confidence": fusion_confidence,
+                        "bearing_source": bearing_source,
+                    }
+                )
+                self.status.emit("Demo Collecting")
+                time.sleep(update_interval)
+        except Exception as e:
+            self.logger.exception("Error in demo loop")
+            self.error.emit(str(e))
+            self.status.emit("Error")
+        finally:
+            self.logger.info("Demo collector thread stopped.")
+            self.status.emit("stopped")
+
+
 class CollectorThread(QtCore.QThread):
     """Runs the record loop without freezing the UI."""
 

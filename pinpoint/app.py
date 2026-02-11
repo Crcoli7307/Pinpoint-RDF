@@ -1,4 +1,15 @@
-"""Application bootstrap and startup flow."""
+"""
+PINPOINT Software Project
+pinpoint/app.py
+Copyright 2026 Crayton Litton. Public Domain.
+MIT License
+---
+Bootstraps the Qt application and applies high-DPI settings.
+Presents the startup dialog and creates the main window based on user choices.
+---
+
+https://nexus.crayton.dev/
+"""
 import multiprocessing
 import os
 import sys

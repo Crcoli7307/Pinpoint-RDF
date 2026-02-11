@@ -1,4 +1,15 @@
-"""Add-on discovery, loading, and menu wiring."""
+"""
+PINPOINT Software Project
+pinpoint/plugin_manager.py
+Copyright 2026 Crayton Litton. Public Domain.
+MIT License
+---
+Discovers and loads add-on plugins from the addons directory.
+Builds and refreshes add-on menus, tracks changes, and supports reloads.
+---
+
+https://nexus.crayton.dev/
+"""
 from __future__ import annotations
 
 import importlib.util

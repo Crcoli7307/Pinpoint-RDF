@@ -1,4 +1,5 @@
-**Pinpoint Direction Finding v8**
+# Pinpoint Direction Finding v8
+
 Pinpoint is a PyQt6-based direction finding application with a plugin-first architecture. Core UI and data collection live in `pinpoint/`, utilities are in `funcs/`, and add-ons are loaded dynamically from `addons/` at runtime. The app can run with zero add-ons present, and add-ons can be hot-swapped without restarting the app.
 
 **Quick Start**

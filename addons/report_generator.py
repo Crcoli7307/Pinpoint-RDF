@@ -1,4 +1,15 @@
-"""Report generator add-on."""
+"""
+PINPOINT Software Project
+addons/report_generator.py
+Copyright 2026 Crayton Litton. Public Domain.
+MIT License
+---
+Implements the Report Generator add-on for building mission reports.
+Provides a multi-tab UI and helpers for stats, maps, and PDF export.
+---
+
+https://nexus.crayton.dev/
+"""
 
 from __future__ import annotations
 

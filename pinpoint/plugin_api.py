@@ -1,4 +1,15 @@
-"""Internal add-on API definitions and event bus."""
+"""
+PINPOINT Software Project
+pinpoint/plugin_api.py
+Copyright 2026 Crayton Litton. Public Domain.
+MIT License
+---
+Defines the add-on API, including plugin metadata and menu action models.
+Implements a lightweight handler registry and event bus for add-ons.
+---
+
+https://nexus.crayton.dev/
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field

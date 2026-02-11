@@ -1,4 +1,15 @@
-"""Function facade for SDR, GPS, and map utilities."""
+"""
+PINPOINT Software Project
+funcs/__init__.py
+Copyright 2026 Crayton Litton. Public Domain.
+MIT License
+---
+Aggregates SDR, GPS, and map helpers into a single import surface.
+Re-exports commonly used third-party modules for convenience.
+---
+
+https://nexus.crayton.dev/
+"""
 
 from .sdr import (
     selectRadio,

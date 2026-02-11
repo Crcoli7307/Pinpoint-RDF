@@ -1,4 +1,15 @@
-"""Pinpoint v8 tests for core utilities and plugin API."""
+"""
+PINPOINT Software Project
+test.py
+Copyright 2026 Crayton Litton. Public Domain.
+MIT License
+---
+Defines pytest coverage for SDR, GPS, map rendering, and plugin API behavior.
+Includes stubs and fixtures so tests run without hardware or optional dependencies.
+---
+
+https://nexus.crayton.dev/
+"""
 
 import importlib
 import logging

@@ -1,4 +1,15 @@
-"""GPS port detection and NMEA parsing helpers."""
+"""
+PINPOINT Software Project
+funcs/gps.py
+Copyright 2026 Crayton Litton. Public Domain.
+MIT License
+---
+Detects GPS serial ports, probes for NMEA output, and reads fixes and satellite data.
+Exposes helper functions for UI selection and continuous reads.
+---
+
+https://nexus.crayton.dev/
+"""
 
 import os
 import time

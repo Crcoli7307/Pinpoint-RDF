@@ -1,4 +1,15 @@
-"""Meshtastic connectivity add-on."""
+"""
+PINPOINT Software Project
+addons/meshtastic_connectivity.py
+Copyright 2026 Crayton Litton. Public Domain.
+MIT License
+---
+Implements the Meshtastic connectivity add-on with connection, handshake, and status handling.
+Provides UI wiring and helpers for linking nodes and displaying messages.
+---
+
+https://nexus.crayton.dev/
+"""
 
 
 from __future__ import annotations

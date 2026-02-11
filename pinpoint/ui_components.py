@@ -1,4 +1,15 @@
-"""UI dialogs, widgets, and worker threads."""
+"""
+PINPOINT Software Project
+pinpoint/ui_components.py
+Copyright 2026 Crayton Litton. Public Domain.
+MIT License
+---
+Defines reusable dialogs, widgets, and worker threads used by the UI.
+Centralizes shared UI helpers such as settings, startup, and info panels.
+---
+
+https://nexus.crayton.dev/
+"""
 from .core import *  # noqa: F401,F403
 
 # ---------------------------

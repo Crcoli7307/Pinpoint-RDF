@@ -1,4 +1,15 @@
-"""SDR device access and signal processing helpers."""
+"""
+PINPOINT Software Project
+funcs/sdr.py
+Copyright 2026 Crayton Litton. Public Domain.
+MIT License
+---
+Wraps SDR device access and signal processing helpers.
+Includes sampling, strength/quality calculations, and device discovery.
+---
+
+https://nexus.crayton.dev/
+"""
 
 import numpy as np
 import rtlsdr

@@ -1,4 +1,15 @@
-"""Main application window and UI logic."""
+"""
+PINPOINT Software Project
+pinpoint/main_window.py
+Copyright 2026 Crayton Litton. Public Domain.
+MIT License
+---
+Implements the primary Qt window, including map display, status panels, and controls.
+Coordinates data collection, playback, and add-on integration.
+---
+
+https://nexus.crayton.dev/
+"""
 from .core import *  # noqa: F401,F403
 from .ui_components import *  # noqa: F401,F403
 from .version import APP_VERSION_NAME
@@ -223,6 +234,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.collecting = False
         self.stop_event = threading.Event()
         self.thread: CollectorThread | None = None
+        self.demo_active = False
+        self._demo_start_state: Optional[dict] = None
+        self._demo_config: Optional[dict] = None
+        self._demo_stopped = False
         self._stop_dialog: Optional[BusyDialog] = None
         self._start_dialog: Optional[BusyDialog] = None
         self.recording_session: Optional[RecordingSession] = None
@@ -516,12 +531,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_info_panel(self):
         mode = "Playback" if self.playback_mode else ("Live" if self.collecting else "Idle")
-        if self.playback_only and not self.playback_mode:
+        if self.demo_active and not self.playback_mode:
+            mode = "Demo"
+        elif self.playback_only and not self.playback_mode:
             mode = "Playback Only"
         elif self.meshtastic_only and not self.playback_mode:
             mode = "Meshtastic Only"
         if self.recording_session is not None and not self.playback_mode:
-            mode = "Live (Recording)"
+            mode = "Demo (Recording)" if self.demo_active else "Live (Recording)"
 
         status_mode = "playback" if self.playback_mode else ("running" if self.collecting else "paused")
         self._set_info_status_gif(status_mode)
@@ -894,6 +911,13 @@ class MainWindow(QtWidgets.QMainWindow):
         return header, frames, flags
 
     def toggle_collection(self):
+        if self.demo_active:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Demo Active",
+                "Stop the demo before starting live data collection.",
+            )
+            return
         if self.playback_only or self.meshtastic_only:
             dlg = PlaybackOnlyDialog(self) if self.playback_only else MeshtasticOnlyDialog(self)
             dlg.exec()
@@ -918,6 +942,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.stop_collection()
 
     def stop_collection(self):
+        if self.demo_active:
+            self.stop_demo()
+            return
         logger.info("Stopping data collection.")
         # mark intention and disable button to avoid repeated clicks
         self.collecting = False
@@ -961,6 +988,119 @@ class MainWindow(QtWidgets.QMainWindow):
             self._finish_stop_ui()
         # Now that the thread has fully finished, release the reference.
         self.thread = None
+
+    def _capture_start_state(self) -> dict:
+        return {
+            "text": self.start_btn.text(),
+            "enabled": self.start_btn.isEnabled(),
+            "class": self.start_btn.property("class"),
+            "action_text": self.start_action.text() if hasattr(self, "start_action") else None,
+            "action_enabled": self.start_action.isEnabled() if hasattr(self, "start_action") else None,
+        }
+
+    def _restore_start_state(self) -> None:
+        if not self._demo_start_state:
+            return
+        state = self._demo_start_state
+        cls = state.get("class") or "primary"
+        self._set_start_state(state.get("text") or "Start Data Collection", cls, enabled=state.get("enabled"))
+        if hasattr(self, "start_action") and self.start_action:
+            action_text = state.get("action_text")
+            action_enabled = state.get("action_enabled")
+            if action_text is not None:
+                self.start_action.setText(action_text)
+            if action_enabled is not None:
+                self.start_action.setEnabled(action_enabled)
+        self._demo_start_state = None
+
+    def start_demo(self, config: Optional[dict] = None) -> None:
+        if self.demo_active:
+            return
+        if self.collecting:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Collection Active",
+                "Stop live data collection before starting the demo.",
+            )
+            return
+        if self.playback_mode:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Playback Active",
+                "Exit playback before starting the demo.",
+            )
+            return
+        self.demo_active = True
+        self.collecting = True
+        self._demo_stopped = False
+        self._demo_start_state = self._capture_start_state()
+        self._demo_config = config or {}
+        if hasattr(self, "api") and self.api:
+            self.api.emit("collection.started", {"ts": time.time(), "demo": True})
+        self._reset_report_cache()
+        self.report_source_label = "Demo Session"
+        self._set_start_state("Demo Running", "primary", enabled=False)
+        if hasattr(self, "start_action") and self.start_action:
+            self.start_action.setEnabled(False)
+        self.last_status_msg = "Demo Starting"
+        self._update_info_panel()
+        self._show_starting_dialog()
+        QtWidgets.QApplication.processEvents()
+        QtCore.QTimer.singleShot(0, self._start_demo_thread)
+
+    def stop_demo(self) -> None:
+        if not self.demo_active:
+            return
+        self.collecting = False
+        self._set_start_state("Stopping...", "danger", enabled=False)
+        if self.thread and self.thread.isRunning():
+            self._show_stopping_dialog()
+            QtWidgets.QApplication.processEvents()
+            QtCore.QTimer.singleShot(0, self._request_stop)
+        else:
+            self._finish_demo_ui()
+
+    def _start_demo_thread(self) -> None:
+        self.stop_event.clear()
+        self.thread = DemoCollectorThread(
+            logger=logger,
+            stop_event=self.stop_event,
+            config=self._demo_config,
+        )
+        self.thread.status.connect(self._on_demo_status)
+        self.thread.error.connect(self._on_thread_error)
+        self.thread.telemetry.connect(self._on_telemetry)
+        self.thread.finished.connect(self._on_demo_finished)
+        self.thread.start()
+
+    def _on_demo_status(self, msg: str) -> None:
+        if msg == "stopped":
+            self._demo_stopped = True
+            self._finish_demo_ui()
+            return
+        if msg:
+            self._on_thread_status(msg)
+
+    def _on_demo_finished(self) -> None:
+        if not self._demo_stopped:
+            self._finish_demo_ui()
+        self._demo_stopped = False
+        self.thread = None
+
+    def _finish_demo_ui(self) -> None:
+        if not self.demo_active and not self._demo_start_state:
+            return
+        self.demo_active = False
+        self._hide_starting_dialog()
+        self._hide_stopping_dialog()
+        self._stop_recording()
+        self._finalize_report_cache()
+        self.collecting = False
+        self.last_status_msg = "stopped"
+        self._restore_start_state()
+        self._update_info_panel()
+        if hasattr(self, "api") and self.api:
+            self.api.emit("collection.stopped", {"ts": time.time(), "demo": True})
 
     def _rescan_hardware(self):
         if self._main_hw_thread is not None:
