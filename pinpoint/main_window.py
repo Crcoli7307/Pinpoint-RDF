@@ -1,0 +1,1789 @@
+"""Main application window and UI logic."""
+from .core import *  # noqa: F401,F403
+from .ui_components import *  # noqa: F401,F403
+from .version import APP_VERSION_NAME
+
+from .plugin_api import PinpointAPI
+from .plugin_manager import AddonManager
+
+try:
+    from PyQt6 import QtWebEngineWidgets  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    QtWebEngineWidgets = None
+
+# ---------------------------
+# Main Window
+# ---------------------------
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self, gps_port: Optional[str] = None, playback_only: bool = False, meshtastic_only: bool = False):
+        super().__init__()
+        self.gps_port = gps_port
+        self.playback_only = playback_only
+        self.meshtastic_only = meshtastic_only
+        self.setWindowTitle(APP_TITLE)
+        self.setMinimumSize(1000, 900)
+        self.resize(1100, 950)
+        self.setStyleSheet(self._style())
+        _apply_app_icon(self)
+        self._psutil_proc = psutil.Process(os.getpid()) if psutil else None
+        self._cpu_primed = False
+        self._last_io = None
+        self._last_io_time = None
+        self.last_status_msg = "Idle"
+
+        # Central widget
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+
+        self._build_menus()
+
+        # Map display (static image fallback + optional interactive view)
+        self.image_label = QtWidgets.QLabel()
+        self.image_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setContentsMargins(12, 12, 12, 12)
+        self.image_label.setMinimumSize(820, 620)
+
+        self.map_view = None
+        if QtWebEngineWidgets is not None:
+            try:
+                self.map_view = QtWebEngineWidgets.QWebEngineView()
+                self.map_view.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.NoContextMenu)
+                self.map_view.setMinimumSize(820, 620)
+                self.map_view.loadFinished.connect(self._on_map_load_finished)
+            except Exception:
+                self.map_view = None
+
+        self.map_container = QtWidgets.QWidget()
+        self.map_stack = QtWidgets.QStackedLayout(self.map_container)
+        self.map_stack.addWidget(self.image_label)
+        if self.map_view is not None:
+            self.map_stack.addWidget(self.map_view)
+        self.map_stack.setCurrentWidget(self.image_label)
+
+        self._interactive_map_enabled = False
+        self._map_initialized = False
+        self._map_ready = False
+        self._pending_map_points = None
+        self._last_map_update = 0.0
+        self._last_map_sig = None
+        self._last_image_mtime = 0
+        self.update_image(force=True)
+
+        # Status row
+        self.gps_label = QtWidgets.QLabel("GPS: --")
+        self.status_label = QtWidgets.QLabel("Status: Idle")
+        self.gps_label.setObjectName("gpsStatus")
+        self.status_label.setObjectName("appStatus")
+        self.gps_label.setVisible(False)
+        self.status_label.setVisible(False)
+
+        # Buttons row
+        self.exit_btn = self._make_btn("Exit", danger=True)
+        self.clear_btn = self._make_btn("Clear App")
+        self.settings_btn = self._make_btn("Update Settings")
+        self.log_btn = self._make_btn("View Log")
+        self.open_recording_btn = self._make_btn("Open Recording")
+        self.gps_info_btn = self._make_btn("GPS Info")
+        self.antenna_info_btn = self._make_btn("Antenna Info")
+        self.start_btn = self._make_btn("Start Data Collection", primary=True, wide=False)
+        self.flag_btn = self._make_btn("Flag")
+        self.flag_btn.setVisible(False)
+
+        self.exit_btn.clicked.connect(self.close)
+        self.clear_btn.clicked.connect(self.clear_app)
+        self.settings_btn.clicked.connect(self.open_settings)
+        self.log_btn.clicked.connect(self.open_log)
+        self.open_recording_btn.clicked.connect(self.open_recording)
+        self.gps_info_btn.clicked.connect(self.open_gps_info)
+        self.antenna_info_btn.clicked.connect(self.open_antenna_info)
+        self.start_btn.clicked.connect(self.toggle_collection)
+        self.flag_btn.clicked.connect(self.open_flag_dialog)
+
+        # Toolbar removed for cleaner menu-only utility layout
+
+        # Info panel under the map
+        self.info_panel = QtWidgets.QFrame()
+        self.info_panel.setObjectName("infoPanel")
+        self.info_summary = QtWidgets.QLabel("Mode: --  |  Activity: --  |  Recording: --  |  Playback: --")
+        self.info_summary.setObjectName("infoSummary")
+        self.info_status_gif = QtWidgets.QLabel()
+        self.info_status_gif.setFixedSize(LOADING_ICON_PX + 8, LOADING_ICON_PX + 8)
+        self.info_status_gif.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self._info_status_movie: Optional[QtGui.QMovie] = None
+        self._info_status_mode: Optional[str] = None
+
+        self._info_values = {}
+        info_grid = QtWidgets.QGridLayout()
+        info_grid.setHorizontalSpacing(16)
+        info_grid.setVerticalSpacing(6)
+
+        items = [
+            ("Mode", "mode"),
+            ("Activity", "activity"),
+            ("GPS", "gps"),
+            ("Satellites", "sats"),
+            ("Fix Age", "fix_age"),
+            ("SDR", "sdr"),
+            ("Signal", "signal"),
+            ("Bearing", "bearing"),
+            ("Target Rel", "target_rel"),
+            ("Source", "source"),
+            ("Confidence", "confidence"),
+            ("Recording", "recording"),
+        ]
+        # Two-column grid of key/value pairs
+        left = items[:6]
+        right = items[6:]
+        for row, (label, key) in enumerate(left):
+            k, v = self._make_info_pair(label)
+            info_grid.addWidget(k, row, 0)
+            info_grid.addWidget(v, row, 1)
+            self._info_values[key] = v
+        for row, (label, key) in enumerate(right):
+            k, v = self._make_info_pair(label)
+            info_grid.addWidget(k, row, 2)
+            info_grid.addWidget(v, row, 3)
+            self._info_values[key] = v
+
+        left_col = QtWidgets.QVBoxLayout()
+        left_col.addWidget(self.info_summary)
+        left_col.addLayout(info_grid)
+
+        right_col = QtWidgets.QVBoxLayout()
+        right_col.addStretch(1)
+        right_col.addWidget(self.info_status_gif, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+        right_col.addSpacing(6)
+        right_col.addWidget(self.flag_btn, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+        right_col.addStretch(1)
+
+        info_layout = QtWidgets.QHBoxLayout(self.info_panel)
+        info_layout.addLayout(left_col, stretch=1)
+        info_layout.addLayout(right_col)
+
+        # Playback controls (hidden until a recording is loaded)
+        self.playback_widget = QtWidgets.QWidget()
+        self.playback_widget.setVisible(False)
+        pb_layout = QtWidgets.QHBoxLayout(self.playback_widget)
+        pb_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.playback_play_btn = self._make_btn("Play")
+        self.playback_slider = FlaggedSlider(QtCore.Qt.Orientation.Horizontal)
+        self.playback_slider.setMinimum(0)
+        self.playback_slider.setMaximum(0)
+        self.playback_slider.setMinimumHeight(40)
+        self.playback_speed = QtWidgets.QComboBox()
+        self.playback_speed.addItems(["1x", "2x", "4x", "8x", "16x", "32x"])
+        self.playback_speed.setCurrentText("1x")
+        self.playback_time_label = QtWidgets.QLabel("00:00 / 00:00")
+        self.playback_close_btn = self._make_btn("Exit Playback")
+
+        pb_layout.addWidget(self.playback_play_btn)
+        pb_layout.addWidget(self.playback_slider, stretch=1)
+        pb_layout.addWidget(self.playback_time_label)
+        pb_layout.addWidget(self.playback_speed)
+        pb_layout.addWidget(self.playback_close_btn)
+
+        self.playback_play_btn.clicked.connect(self._toggle_playback)
+        self.playback_slider.sliderPressed.connect(self._on_playback_slider_pressed)
+        self.playback_slider.sliderReleased.connect(self._on_playback_slider_released)
+        self.playback_slider.valueChanged.connect(self._on_playback_scrub)
+        self.playback_speed.currentTextChanged.connect(self._on_playback_speed_changed)
+        self.playback_close_btn.clicked.connect(self._exit_playback)
+
+        # Layout
+        layout = QtWidgets.QVBoxLayout(central)
+        layout.addWidget(self.map_container, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+        layout.addSpacing(8)
+        layout.addSpacing(6)
+        layout.addWidget(self.info_panel)
+        layout.addSpacing(6)
+        layout.addWidget(self.playback_widget)
+        layout.addSpacing(8)
+
+        # Status bar (CPU/RAM/Disk + clock)
+        self.stats_label = QtWidgets.QLabel("CPU: --  RAM: --  Disk: --")
+        self.clock_label = QtWidgets.QLabel("--:--:--")
+        status = self.statusBar()
+        status.addWidget(self.stats_label, 1)
+        status.addPermanentWidget(self.clock_label)
+
+        self._stats_timer = QtCore.QTimer(self)
+        self._stats_timer.setInterval(1000)
+        self._stats_timer.timeout.connect(self._update_status_bar)
+        self._stats_timer.start()
+        self._update_status_bar()
+
+        # Timer to refresh image
+        self.image_timer = QtCore.QTimer(self)
+        self.image_timer.setInterval(1000)
+        self.image_timer.timeout.connect(self.update_image)
+        self.image_timer.start()
+
+        # Thread control
+        self.collecting = False
+        self.stop_event = threading.Event()
+        self.thread: CollectorThread | None = None
+        self._stop_dialog: Optional[BusyDialog] = None
+        self._start_dialog: Optional[BusyDialog] = None
+        self.recording_session: Optional[RecordingSession] = None
+        self.recording_path: Optional[str] = None
+        self.report_cache_frames: list[dict] = []
+        self.report_cache_active = False
+        self.report_cache_started_at: Optional[float] = None
+        self.report_source_label: Optional[str] = None
+        self.report_header: Optional[dict] = None
+        self._main_hw_thread: Optional[HardwareCheckThread] = None
+        self._rescan_dialog: Optional[BusyDialog] = None
+        self.playback_mode = False
+        self.playback_frames: list[dict] = []
+        self.playback_flags: list[dict] = []
+        self.playback_index = 0
+        self.playback_speed_factor = 1.0
+        self.playback_timer = QtCore.QTimer(self)
+        self.playback_timer.setInterval(30)
+        self.playback_timer.timeout.connect(self._on_playback_tick)
+        self._playback_playing = False
+        self._playback_start_wall = 0.0
+        self._playback_start_t = 0.0
+        self._playback_last_map_bytes: Optional[bytes] = None
+        self._playback_slider_dragging = False
+        self._gps_info_dialog: Optional[GPSInfoDialog] = None
+        self._antenna_info_dialog: Optional[AntennaInfoDialog] = None
+        self._last_info_dialog_refresh = 0.0
+        self.latest_satellites = []
+        self.latest_gps_fix = None
+        self.latest_sats = None
+        self.latest_fix_age = None
+        self.latest_strength = None
+        self.latest_snr = None
+        self.latest_quality = None
+        self.sdr_connected = True
+        self.sdr_error = None
+        self.sdr_sample_rate = None
+        self.antenna_count = settings.antenna_count
+        self.antenna_states = []
+        self.current_bearing = None
+        self.target_bearing = None
+        self.target_relative = None
+        self.aoa_confidence = 0.0
+        self.map_confidence = 0.0
+        self.fusion_confidence = 0.0
+        self.bearing_source = None
+        # Clear app on startup to match original behavior
+        QtCore.QTimer.singleShot(50, self.clear_app)
+
+        # Initialize info panel after state is ready
+        self._update_info_panel()
+        self._refresh_map_mode(force=True)
+        self._init_addons()
+
+        if self.playback_only or self.meshtastic_only:
+            label = "Playback Only" if self.playback_only else "Meshtastic Only"
+            self._set_start_state(label, "primary", enabled=False)
+            if hasattr(self, "start_action") and self.start_action:
+                self.start_action.setEnabled(False)
+
+    # ---------- UI helpers ----------
+    def _build_menus(self):
+        menubar = self.menuBar()
+
+        file_menu = menubar.addMenu("File")
+        view_menu = menubar.addMenu("View")
+        settings_menu = menubar.addMenu("Settings")
+        collection_menu = menubar.addMenu("Collection")
+        self.addons_menu = menubar.addMenu("Add-ons")
+
+        self.open_recording_action = QtGui.QAction("Open Recording...", self)
+        self.open_recording_action.triggered.connect(self.open_recording)
+        self.exit_playback_action = QtGui.QAction("Exit Playback", self)
+        self.exit_playback_action.setEnabled(False)
+        self.exit_playback_action.triggered.connect(self._exit_playback)
+        self.info_action = QtGui.QAction("Info / About...", self)
+        self.info_action.triggered.connect(self.open_app_info)
+        self.exit_action = QtGui.QAction("Exit", self)
+        self.exit_action.triggered.connect(self.close)
+
+        self.log_action = QtGui.QAction("View Log", self)
+        self.log_action.triggered.connect(self.open_log)
+        self.gps_info_action = QtGui.QAction("GPS Info", self)
+        self.gps_info_action.triggered.connect(self.open_gps_info)
+        self.antenna_info_action = QtGui.QAction("Antenna Info", self)
+        self.antenna_info_action.triggered.connect(self.open_antenna_info)
+        self.settings_action = QtGui.QAction("Update Settings", self)
+        self.settings_action.triggered.connect(self.open_settings)
+
+        self.start_action = QtGui.QAction("Start Data Collection", self)
+        self.start_action.triggered.connect(self.toggle_collection)
+        self.clear_action = QtGui.QAction("Clear App", self)
+        self.clear_action.triggered.connect(self.clear_app)
+
+        file_menu.addAction(self.open_recording_action)
+        file_menu.addAction(self.exit_playback_action)
+        file_menu.addAction(self.info_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.exit_action)
+
+        view_menu.addAction(self.log_action)
+        view_menu.addAction(self.gps_info_action)
+        view_menu.addAction(self.antenna_info_action)
+        settings_menu.addAction(self.settings_action)
+
+        collection_menu.addAction(self.start_action)
+        collection_menu.addAction(self.clear_action)
+
+        self.addons_menu.addAction(QtGui.QAction("Loading add-ons...", self))
+
+    def _init_addons(self) -> None:
+        self.api = PinpointAPI(logger=logger)
+        self._register_api_handlers()
+        addons_dir = _resource_path("addons")
+        self.api.set_context(main_window=self, addons_dir=addons_dir)
+        if hasattr(self, "addons_menu") and self.addons_menu:
+            self.addon_manager = AddonManager(
+                api=self.api,
+                addons_dir=addons_dir,
+                menu=self.addons_menu,
+                logger=logger,
+                parent=self,
+            )
+            self.addon_manager.load_all()
+            self.addon_manager.start_watch()
+            self.addons_menu.aboutToShow.connect(self.addon_manager.refresh_enabled_states)
+            self.api.emit("app.ready", {"ts": time.time()})
+        else:
+            self.addon_manager = None
+
+    def _register_api_handlers(self) -> None:
+        self.api.register("core.get_version", lambda _p: {"version": APP_VERSION})
+        self.api.register("core.get_title", lambda _p: {"title": APP_TITLE})
+        self.api.register("core.get_resource_path", self._api_resource_path)
+        self.api.register("core.get_settings", self._api_get_settings)
+
+        self.api.register("ui.get_main_window", lambda _p: {"window": self})
+        self.api.register("ui.show_message", self._api_show_message)
+
+        self.api.register("data.get_report_data", lambda _p: {"data": self._get_report_data()})
+        self.api.register("data.get_history_points", lambda _p: {"points": self._get_history_points()})
+        self.api.register("data.report_available", lambda _p: {"available": self._report_available()})
+
+        self.api.register("log.debug", lambda p: self._api_log(logging.DEBUG, p))
+        self.api.register("log.info", lambda p: self._api_log(logging.INFO, p))
+        self.api.register("log.warning", lambda p: self._api_log(logging.WARNING, p))
+        self.api.register("log.error", lambda p: self._api_log(logging.ERROR, p))
+
+        self.api.register("bus.emit", self._api_bus_emit)
+        self.api.register("bus.subscribe", self._api_bus_subscribe)
+        self.api.register("bus.unsubscribe", self._api_bus_unsubscribe)
+        self.api.register("addons.reload", lambda _p: self._api_addons_reload())
+        self.api.register("addons.refresh_actions", lambda _p: self._api_addons_refresh())
+
+    def _api_resource_path(self, payload: dict) -> dict:
+        parts = payload.get("parts") or []
+        if not isinstance(parts, (list, tuple)):
+            parts = [parts]
+        return {"path": _resource_path(*[str(p) for p in parts])}
+
+    def _api_get_settings(self, _payload: dict) -> dict:
+        with settings_lock:
+            return {"settings": settings.to_dict()}
+
+    def _api_show_message(self, payload: dict) -> dict:
+        title = payload.get("title") or "Pinpoint"
+        message = payload.get("message") or ""
+        level = (payload.get("level") or "info").lower()
+        if level == "warning":
+            QtWidgets.QMessageBox.warning(self, title, message)
+        elif level in ("error", "critical"):
+            QtWidgets.QMessageBox.critical(self, title, message)
+        else:
+            QtWidgets.QMessageBox.information(self, title, message)
+        return {"ok": True}
+
+    def _api_log(self, level: int, payload: dict) -> dict:
+        msg = payload.get("message")
+        if not msg:
+            return {"ok": False, "error": "Missing 'message'."}
+        logger.log(level, str(msg))
+        return {"ok": True}
+
+    def _api_bus_emit(self, payload: dict) -> dict:
+        event = payload.get("event")
+        if not event:
+            return {"ok": False, "error": "Missing 'event'."}
+        data = payload.get("data") or {}
+        self.api.emit(str(event), data if isinstance(data, dict) else {"data": data})
+        return {"ok": True}
+
+    def _api_bus_subscribe(self, payload: dict) -> dict:
+        event = payload.get("event")
+        handler = payload.get("handler")
+        if not event or not callable(handler):
+            return {"ok": False, "error": "Missing 'event' or callable 'handler'."}
+        token = self.api.subscribe(str(event), handler)
+        return {"ok": True, "token": token}
+
+    def _api_bus_unsubscribe(self, payload: dict) -> dict:
+        token = payload.get("token")
+        try:
+            token = int(token)
+        except Exception:
+            return {"ok": False, "error": "Invalid 'token'."}
+        removed = self.api.unsubscribe(token)
+        return {"ok": True, "removed": removed}
+
+    def _api_addons_reload(self) -> dict:
+        if hasattr(self, "addon_manager") and self.addon_manager:
+            self.addon_manager.reload()
+        return {"ok": True}
+
+    def _api_addons_refresh(self) -> dict:
+        if hasattr(self, "addon_manager") and self.addon_manager:
+            self.addon_manager.refresh_enabled_states()
+        return {"ok": True}
+
+    def _build_toolbar(self):
+        self.toolbar = QtWidgets.QToolBar("Controls")
+        self.toolbar.setMovable(False)
+        self.toolbar.setFloatable(False)
+        self.toolbar.setIconSize(QtCore.QSize(18, 18))
+        self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, self.toolbar)
+
+        self.toolbar.addWidget(self.start_btn)
+        self.toolbar.addWidget(self.clear_btn)
+        self.toolbar.addSeparator()
+        self.toolbar.addWidget(self.open_recording_btn)
+        self.toolbar.addSeparator()
+        self.toolbar.addWidget(self.settings_btn)
+        self.toolbar.addWidget(self.log_btn)
+        self.toolbar.addSeparator()
+        self.toolbar.addWidget(self.gps_info_btn)
+        self.toolbar.addWidget(self.antenna_info_btn)
+        self.toolbar.addSeparator()
+        self.toolbar.addWidget(self.exit_btn)
+
+    def _make_btn(self, text, primary=False, danger=False, wide=False):
+        btn = QtWidgets.QPushButton(text)
+        if primary:
+            btn.setProperty("class", "primary")
+        if danger:
+            btn.setProperty("class", "danger")
+        if wide:
+            btn.setMinimumWidth(200)
+        return btn
+
+    def _make_info_pair(self, text: str):
+        key = QtWidgets.QLabel(f"{text}:")
+        key.setObjectName("infoKey")
+        val = QtWidgets.QLabel("--")
+        val.setObjectName("infoValue")
+        val.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        return key, val
+
+    def _set_start_state(self, text: str, cls: str, enabled: Optional[bool] = None):
+        self.start_btn.setText(text)
+        if enabled is not None:
+            self.start_btn.setEnabled(enabled)
+        self.start_btn.setProperty("class", cls)
+        self.start_btn.style().unpolish(self.start_btn); self.start_btn.style().polish(self.start_btn)
+        if hasattr(self, "start_action") and self.start_action:
+            self.start_action.setText(text)
+            if enabled is not None:
+                self.start_action.setEnabled(enabled)
+
+    def _set_info_status_gif(self, mode: str) -> None:
+        if self._info_status_mode == mode:
+            return
+        if self._info_status_movie is not None:
+            self._info_status_movie.stop()
+            self._info_status_movie.deleteLater()
+            self._info_status_movie = None
+
+        asset = _status_anim_for_mode(mode)
+        if asset and os.path.exists(asset):
+            processed = _transparentize_gif(asset)
+            movie = QtGui.QMovie(processed)
+            if movie.isValid():
+                movie.setScaledSize(QtCore.QSize(LOADING_ICON_PX, LOADING_ICON_PX))
+                self.info_status_gif.setMovie(movie)
+                movie.start()
+                self._info_status_movie = movie
+                self._info_status_mode = mode
+                return
+
+        icon = self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MessageBoxInformation)
+        self.info_status_gif.setPixmap(icon.pixmap(LOADING_ICON_PX, LOADING_ICON_PX))
+        self._info_status_mode = mode
+
+    def _update_info_panel(self):
+        mode = "Playback" if self.playback_mode else ("Live" if self.collecting else "Idle")
+        if self.playback_only and not self.playback_mode:
+            mode = "Playback Only"
+        elif self.meshtastic_only and not self.playback_mode:
+            mode = "Meshtastic Only"
+        if self.recording_session is not None and not self.playback_mode:
+            mode = "Live (Recording)"
+
+        status_mode = "playback" if self.playback_mode else ("running" if self.collecting else "paused")
+        self._set_info_status_gif(status_mode)
+
+        playback_text = "--"
+        if self.playback_mode:
+            playback_text = f"ON {self.playback_speed_factor:.0f}x"
+
+        record_text = "ON" if self.recording_session is not None else "OFF"
+        if self.recording_session is not None and self.recording_path:
+            record_text = f"ON ({os.path.basename(self.recording_path)})"
+        flag_active = self.recording_session is not None and self.collecting and not self.playback_mode
+        self.flag_btn.setVisible(flag_active)
+        self.flag_btn.setEnabled(flag_active)
+
+        activity = getattr(self, "last_status_msg", None) or ("Collecting" if self.collecting else "Idle")
+
+        gps_text = "--"
+        if self.latest_gps_fix is True:
+            gps_text = "FIX"
+        elif self.latest_gps_fix is False:
+            gps_text = "NO FIX"
+
+        sats_text = "--" if self.latest_sats is None else str(self.latest_sats)
+        fix_age_text = "--" if self.latest_fix_age is None else f"{self.latest_fix_age:.0f}s"
+
+        sdr_text = "Connected" if self.sdr_connected else "No SDR"
+        if self.sdr_sample_rate:
+            sdr_text += f" @ {self.sdr_sample_rate/1e6:.2f}MS/s"
+        if self.sdr_error:
+            sdr_text += " (Err)"
+
+        strength = self.latest_strength
+        snr = self.latest_snr
+        quality = self.latest_quality
+        signal_text = "S=--  SNR=--  Q=--"
+        if strength is not None:
+            signal_text = f"S={strength}  SNR={snr:.2f}" if snr is not None else f"S={strength}  SNR=--"
+            if quality is not None:
+                signal_text += f"  Q={quality:.2f}"
+
+        cur = self.current_bearing
+        tgt = self.target_bearing
+        rel = self.target_relative
+        bearing_text = f"Cur: {cur:.0f}°  Tgt: {tgt:.0f}°" if cur is not None and tgt is not None else "--"
+        rel_text = "--" if rel is None else f"{rel:.0f}°"
+
+        src_text = (self.bearing_source or "--").upper()
+        conf_text = "--"
+        if self.aoa_confidence is not None or self.map_confidence is not None or self.fusion_confidence is not None:
+            aoa = "--" if self.aoa_confidence is None else f"{self.aoa_confidence:.2f}"
+            mp = "--" if self.map_confidence is None else f"{self.map_confidence:.2f}"
+            fu = "--" if self.fusion_confidence is None else f"{self.fusion_confidence:.2f}"
+            conf_text = f"A:{aoa}  M:{mp}  F:{fu}"
+
+        self.info_summary.setText(
+            f"Mode: {mode}  |  Activity: {activity}  |  Recording: {record_text}  |  Playback: {playback_text}"
+        )
+        self._info_values["mode"].setText(mode)
+        self._info_values["activity"].setText(activity)
+        self._info_values["gps"].setText(gps_text)
+        self._info_values["sats"].setText(sats_text)
+        self._info_values["fix_age"].setText(fix_age_text)
+        self._info_values["sdr"].setText(sdr_text)
+        self._info_values["signal"].setText(signal_text)
+        self._info_values["bearing"].setText(bearing_text)
+        self._info_values["target_rel"].setText(rel_text)
+        self._info_values["source"].setText(src_text)
+        self._info_values["confidence"].setText(conf_text)
+        self._info_values["recording"].setText(record_text)
+
+    def _update_status_bar(self):
+        self.clock_label.setText(time.strftime("%H:%M:%S"))
+        if not self._psutil_proc:
+            self.stats_label.setText("CPU: --  RAM: --  Disk: --")
+            return
+        try:
+            if not self._cpu_primed:
+                self._psutil_proc.cpu_percent(None)
+                self._cpu_primed = True
+                cpu = 0.0
+            else:
+                cpu = self._psutil_proc.cpu_percent(None)
+            mem = self._psutil_proc.memory_info().rss / (1024 * 1024)
+            io = self._psutil_proc.io_counters()
+            now = time.time()
+            disk_text = "--"
+            if io and self._last_io is not None and self._last_io_time:
+                dt = max(1e-6, now - self._last_io_time)
+                read_rate = (io.read_bytes - self._last_io.read_bytes) / dt
+                write_rate = (io.write_bytes - self._last_io.write_bytes) / dt
+                disk_text = f"{self._fmt_rate(read_rate)}/{self._fmt_rate(write_rate)}"
+            self._last_io = io
+            self._last_io_time = now
+            self.stats_label.setText(f"CPU: {cpu:.0f}%  RAM: {mem:.0f} MB  Disk: {disk_text}")
+        except Exception:
+            self.stats_label.setText("CPU: --  RAM: --  Disk: --")
+
+    @staticmethod
+    def _fmt_rate(bytes_per_s: float) -> str:
+        try:
+            b = float(bytes_per_s)
+        except Exception:
+            return "--"
+        if b >= 1024 * 1024:
+            return f"{b / (1024 * 1024):.1f} MB/s"
+        if b >= 1024:
+            return f"{b / 1024:.1f} KB/s"
+        return f"{b:.0f} B/s"
+
+    def _style(self):
+        # Light, clean aesthetic
+        return (
+            """
+            QMainWindow { background: #ffffff; }
+            QMenuBar { background: #f3f4f6; padding: 2px 6px; }
+            QMenuBar::item { background: transparent; padding: 4px 10px; margin: 0 2px; }
+            QMenuBar::item:selected { background: #e5e7eb; }
+            QToolBar { background: #f9fafb; border-bottom: 1px solid #e5e7eb; spacing: 6px; padding: 4px; }
+            QToolBar QPushButton { padding: 6px 10px; border-radius: 8px; }
+            QStatusBar { background: #f9fafb; border-top: 1px solid #e5e7eb; color: #374151; }
+            QStatusBar QLabel { padding: 2px 6px; }
+            #infoPanel { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 10px; padding: 8px; }
+            #infoSummary { font-weight: 600; color: #111827; padding-bottom: 4px; }
+            #infoKey { color: #6b7280; }
+            #infoValue { color: #111827; }
+            #appTitle {
+                font-size: 22px; font-weight: 700; padding: 16px 0; color: #111827;
+            }
+            QPushButton {
+                border: 0; border-radius: 12px; padding: 12px 18px; font-weight: 600;
+                background: #f3f4f6; color: #111827;
+            }
+            QPushButton:hover { background: #e5e7eb; }
+            QPushButton[class="primary"] { background: #10b981; color: white; }
+            QPushButton[class="primary"]:hover { background: #059669; }
+            QPushButton[class="danger"] { background: #ef4444; color: white; }
+            QPushButton[class="danger"]:hover { background: #dc2626; }
+            QLabel { color: #111827; }
+            QLineEdit { padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 8px; }
+            QDialogButtonBox QPushButton { padding: 10px 14px; }
+            QPlainTextEdit { border: 1px solid #e5e7eb; border-radius: 10px; }
+            #gpsStatus, #appStatus { font-size: 12px; color: #374151; padding: 4px 6px; }
+            """
+        )
+
+    # ---------- Actions ----------
+    def open_settings(self):
+        SettingsDialog(self).exec()
+        self._refresh_map_mode(force=True)
+
+    def open_log(self):
+        LogWindow(self).exec()
+
+    def open_app_info(self):
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("About Pinpoint")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(520)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(20, 20, 20, 16)
+        layout.setSpacing(12)
+
+        logo_label = QtWidgets.QLabel()
+        pix = QtGui.QPixmap(PINPOINT_IMAGE_FALLBACK)
+        if not pix.isNull():
+            pix = pix.scaled(
+                260,
+                140,
+                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation,
+            )
+            logo_label.setPixmap(pix)
+            logo_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(logo_label)
+
+        title_label = QtWidgets.QLabel(APP_TITLE)
+        title_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        title_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        layout.addWidget(title_label)
+
+        version_text = f"{APP_VERSION}"
+        if APP_VERSION_NAME and APP_VERSION_NAME not in APP_VERSION:
+            version_text = f"{APP_VERSION} ({APP_VERSION_NAME})"
+
+        pyqt_version = getattr(QtCore, "PYQT_VERSION_STR", "unknown")
+        qt_version = getattr(QtCore, "QT_VERSION_STR", "unknown")
+        info_html = "<br>".join(
+            [
+                f"<b>Version:</b> {version_text}",
+                f"<b>Python:</b> {sys.version.split()[0]}",
+                f"<b>Qt:</b> {qt_version} | <b>PyQt:</b> {pyqt_version}",
+                f"<b>Executable:</b> {sys.executable}",
+                f"<b>Add-ons:</b> {_resource_path('addons')}",
+                f"<b>Log:</b> {os.path.abspath(LOG_FILE)}",
+            ]
+        )
+        info_label = QtWidgets.QLabel(info_html)
+        info_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        copyright_label = QtWidgets.QLabel("Copyright 2026 Crayton Litton")
+        copyright_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(copyright_label)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+
+        dlg.exec()
+
+    def open_recording(self, required: bool = False) -> bool:
+        if self.collecting:
+            QtWidgets.QMessageBox.information(self, "Recording Active", "Stop data collection before opening a recording.")
+            return False
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Open Recording",
+            "",
+            "Pinpoint Playback (*.pinplyr)",
+        )
+        if not path:
+            if required:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Recording Required",
+                    "A recording must be selected to continue in playback-only mode.",
+                )
+            return False
+        import_dialog = BusyDialog(
+            title="Importing",
+            text="Importing playback...",
+            mode="import",
+            parent=self,
+            show_progress=True,
+        )
+        import_dialog.show()
+        QtWidgets.QApplication.processEvents()
+        load_error = None
+
+        def _update_progress(pct: int) -> None:
+            import_dialog.set_progress(pct)
+            QtWidgets.QApplication.processEvents()
+
+        try:
+            header, frames, flags = self._load_pinplyr(path, progress_cb=_update_progress)
+        except Exception as e:
+            load_error = e
+            header, frames, flags = {}, [], []
+        finally:
+            import_dialog.close()
+            import_dialog.deleteLater()
+        if load_error is not None:
+            QtWidgets.QMessageBox.warning(self, "Open Failed", f"Could not open recording:\n{load_error}")
+            return False
+        if not frames:
+            QtWidgets.QMessageBox.information(self, "Empty Recording", "This recording has no frames.")
+            return False
+        self.report_cache_frames = frames
+        self.report_source_label = os.path.basename(path)
+        self.report_cache_active = False
+        self.report_header = header
+        self.playback_flags = flags
+        self._refresh_report_action()
+        self._enter_playback(frames, header=header, flags=flags)
+        return True
+
+    def open_gps_info(self):
+        dlg = GPSInfoDialog(self._get_latest_satellites, self._get_info_refresh_s, self)
+        self._gps_info_dialog = dlg
+        try:
+            dlg.exec()
+        finally:
+            self._gps_info_dialog = None
+
+    def _get_latest_satellites(self):
+        return list(self.latest_satellites or [])
+
+    def _get_info_refresh_s(self):
+        with settings_lock:
+            return settings.info_refresh_s
+
+    def open_antenna_info(self):
+        dlg = AntennaInfoDialog(self._get_antenna_info, self._get_info_refresh_s, self)
+        self._antenna_info_dialog = dlg
+        try:
+            dlg.exec()
+        finally:
+            self._antenna_info_dialog = None
+
+    def open_flag_dialog(self):
+        if self.recording_session is None or not self.collecting:
+            return
+        dlg = FlagDialog(self)
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            data = dlg.flag_data()
+            self._record_flag(data)
+
+    def _record_flag(self, data: dict) -> None:
+        if self.recording_session is None:
+            return
+        reason = (data.get("reason") or "Flag").strip()
+        note = (data.get("note") or "").strip()
+        try:
+            self.recording_session.record_flag(reason, note)
+        except Exception as e:
+            logger.error("Failed to record flag: %s", e)
+
+    def _get_antenna_info(self):
+        with settings_lock:
+            freq = settings.frequency
+            antenna_count = settings.antenna_count
+            profile = settings.calibration_profile
+            spacing_in = settings.antenna_spacing_in
+        return {
+            "frequency_mhz": freq,
+            "antenna_count": antenna_count,
+            "antenna_spacing_in": spacing_in,
+            "ideal_spacing_in": _ideal_spacing_inches(freq),
+            "strength": self.latest_strength,
+            "snr": self.latest_snr,
+            "quality": self.latest_quality,
+            "sdr_connected": self.sdr_connected,
+            "sdr_error": self.sdr_error,
+            "sdr_sample_rate": self.sdr_sample_rate,
+            "antenna_states": self.antenna_states,
+            "current_bearing": self.current_bearing,
+            "target_bearing": self.target_bearing,
+            "target_relative": self.target_relative,
+            "aoa_confidence": self.aoa_confidence,
+            "map_confidence": self.map_confidence,
+            "fusion_confidence": self.fusion_confidence,
+            "bearing_source": self.bearing_source,
+            "calibration_profile": profile,
+        }
+
+    @staticmethod
+    def _load_pinplyr(path: str, progress_cb: Optional[Callable[[int], None]] = None) -> tuple[dict, list[dict], list[dict]]:
+        header = {}
+        frames = []
+        flags = []
+        total_bytes = 0
+        try:
+            total_bytes = os.path.getsize(path)
+        except OSError:
+            total_bytes = 0
+        last_emit = 0
+        with open(path, "rb") as f:
+            for raw in f:
+                if total_bytes:
+                    pos = f.tell()
+                    if pos - last_emit >= 256 * 1024 or pos >= total_bytes:
+                        pct = int(min(100, (pos / total_bytes) * 100))
+                        if progress_cb:
+                            progress_cb(pct)
+                        last_emit = pos
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if obj.get("type") == "pinplyr":
+                    header = obj
+                elif obj.get("type") == "flag":
+                    flags.append(obj)
+                else:
+                    frames.append(obj)
+        if progress_cb:
+            progress_cb(100)
+        return header, frames, flags
+
+    def toggle_collection(self):
+        if self.playback_only or self.meshtastic_only:
+            dlg = PlaybackOnlyDialog(self) if self.playback_only else MeshtasticOnlyDialog(self)
+            dlg.exec()
+            if dlg.result_choice == "rescan":
+                self._rescan_hardware()
+            return
+        if not self.collecting:
+            if self.playback_mode:
+                QtWidgets.QMessageBox.information(self, "Playback Active", "Exit playback before starting collection.")
+                return
+            logger.info("Starting data collection.")
+            self.collecting = True
+            if hasattr(self, "api") and self.api:
+                self.api.emit("collection.started", {"ts": time.time()})
+            self._reset_report_cache()
+            self._maybe_prompt_recording()
+            self._set_start_state("Stop Data Collection", "danger")
+            self._show_starting_dialog()
+            QtWidgets.QApplication.processEvents()
+            QtCore.QTimer.singleShot(0, self._start_collection_thread)
+        else:
+            self.stop_collection()
+
+    def stop_collection(self):
+        logger.info("Stopping data collection.")
+        # mark intention and disable button to avoid repeated clicks
+        self.collecting = False
+        # Update UI immediately to show stopping state
+        self._set_start_state("Stopping...", "danger", enabled=False)
+
+        if self.thread and self.thread.isRunning():
+            self._show_stopping_dialog()
+            QtWidgets.QApplication.processEvents()
+            QtCore.QTimer.singleShot(0, self._request_stop)
+        else:
+            self._finish_stop_ui()
+
+    def _request_stop(self):
+        self.stop_event.set()
+
+    def _on_thread_status(self, msg: str):
+        if msg:
+            self.status_label.setText(f"Status: {msg}")
+            self.last_status_msg = msg
+            self._update_info_panel()
+            if self._start_dialog is not None and msg != "stopped":
+                self._hide_starting_dialog()
+        if msg == "stopped":
+            self.collecting = False
+            self._finish_stop_ui()
+
+    def _on_thread_error(self, err: str):
+        # Surface as a transient message; also in logs
+        if self._start_dialog is not None:
+            self._hide_starting_dialog()
+        QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), f"Collector error: {err}")
+        self.last_status_msg = "Error"
+        self._update_info_panel()
+        if hasattr(self, "api") and self.api:
+            self.api.emit("collection.error", {"error": err, "ts": time.time()})
+
+    def _on_thread_finished(self):
+        # Defensive: ensure UI is reset even if "stopped" status isn't emitted
+        if not self.collecting:
+            self._finish_stop_ui()
+        # Now that the thread has fully finished, release the reference.
+        self.thread = None
+
+    def _rescan_hardware(self):
+        if self._main_hw_thread is not None:
+            try:
+                if self._main_hw_thread.isRunning():
+                    return
+            except RuntimeError:
+                self._main_hw_thread = None
+        self._rescan_dialog = BusyDialog(
+            title="Rescanning",
+            text="Rescanning devices...",
+            mode="general",
+            parent=self,
+        )
+        self._rescan_dialog.show()
+        QtWidgets.QApplication.processEvents()
+        self._main_hw_thread = HardwareCheckThread(self)
+        self._main_hw_thread.result.connect(self._on_main_hardware_check)
+        self._main_hw_thread.finished.connect(self._on_main_hardware_check_finished)
+        self._main_hw_thread.start()
+
+    def _on_main_hardware_check(self, has_sdr: bool, has_gps: bool):
+        if self._rescan_dialog is not None:
+            self._rescan_dialog.close()
+            self._rescan_dialog.deleteLater()
+            self._rescan_dialog = None
+        if has_sdr or has_gps:
+            self._reinitialize_hardware()
+        else:
+            if self.playback_only:
+                dlg = PlaybackOnlyDialog(self)
+            elif self.meshtastic_only:
+                dlg = MeshtasticOnlyDialog(self)
+            else:
+                dlg = PlaybackOnlyDialog(self)
+            dlg.exec()
+            if dlg.result_choice == "rescan":
+                QtCore.QTimer.singleShot(150, self._rescan_hardware)
+
+    def _on_main_hardware_check_finished(self):
+        self._main_hw_thread = None
+
+    def _reinitialize_hardware(self):
+        dlg = GPSStartupDialog(parent=self)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+
+        if dlg.playback_only():
+            self.playback_only = True
+            self.meshtastic_only = False
+            self._set_start_state("Playback Only", "primary", enabled=False)
+            if hasattr(self, "start_action") and self.start_action:
+                self.start_action.setEnabled(False)
+            self._update_info_panel()
+            return
+
+        if dlg.meshtastic_only():
+            self.meshtastic_only = True
+            self.playback_only = False
+            self._set_start_state("Meshtastic Only", "primary", enabled=False)
+            if hasattr(self, "start_action") and self.start_action:
+                self.start_action.setEnabled(False)
+            self._update_info_panel()
+            return
+
+        self.playback_only = False
+        self.meshtastic_only = False
+        self.gps_port = dlg.selected_port()
+        if self.gps_port:
+            os.environ["GPS_PORT"] = self.gps_port
+        self._set_start_state("Start Data Collection", "primary", enabled=True)
+        if hasattr(self, "start_action") and self.start_action:
+            self.start_action.setEnabled(True)
+        self._update_info_panel()
+
+    # ---------- Report cache ----------
+    def _reset_report_cache(self):
+        self.report_cache_frames = []
+        self.report_cache_active = True
+        self.report_cache_started_at = time.time()
+        self.report_source_label = "Live Collection"
+        self.report_header = None
+        self._refresh_report_action()
+
+    def _finalize_report_cache(self):
+        self.report_cache_active = False
+        if not self.report_cache_frames:
+            self.report_source_label = None
+        self._refresh_report_action()
+
+    def _cache_report_frame(self, telemetry: dict):
+        if not self.report_cache_active:
+            return
+        if self.report_cache_started_at is None:
+            self.report_cache_started_at = time.time()
+        t = time.time() - self.report_cache_started_at
+        self.report_cache_frames.append({"t": round(t, 3), "telemetry": telemetry})
+        max_frames = REPORT_CACHE_MAX_FRAMES
+        if max_frames and max_frames > 0 and len(self.report_cache_frames) > max_frames:
+            self.report_cache_frames = self.report_cache_frames[-max_frames:]
+
+    def _report_available(self) -> bool:
+        return bool(self.report_cache_frames) and not self.collecting
+
+    def _refresh_report_action(self):
+        if hasattr(self, "addon_manager") and self.addon_manager:
+            self.addon_manager.refresh_enabled_states()
+
+    def _get_history_points(self) -> list[dict]:
+        frames = list(self.report_cache_frames or [])
+        points = []
+        for frame in frames:
+            tele = frame.get("telemetry") or {}
+            gps_loc = tele.get("gps_loc")
+            if not gps_loc:
+                continue
+            try:
+                lat, lon = gps_loc
+            except Exception:
+                continue
+            points.append(
+                {
+                    "t": frame.get("t"),
+                    "lat": lat,
+                    "lon": lon,
+                    "strength": tele.get("strength"),
+                    "snr": tele.get("snr"),
+                    "quality": tele.get("quality"),
+                    "gps_fix": tele.get("gps_fix"),
+                    "sats": tele.get("sats"),
+                    "bearing_source": tele.get("bearing_source"),
+                }
+            )
+        return points
+
+    def _get_report_data(self) -> dict:
+        with settings_lock:
+            s = settings.to_dict()
+        if self.report_header and isinstance(self.report_header.get("settings"), dict):
+            s = self.report_header.get("settings") or s
+        map_png_b64 = None
+        # Prefer last embedded map from playback if available
+        for frame in reversed(self.report_cache_frames):
+            if frame.get("map_png"):
+                map_png_b64 = frame.get("map_png")
+                break
+        start_time = None
+        if self.report_header and self.report_header.get("created_utc"):
+            start_time = self.report_header.get("created_utc")
+        elif self.report_cache_started_at:
+            start_time = datetime.datetime.fromtimestamp(self.report_cache_started_at).isoformat()
+        return {
+            "frames": list(self.report_cache_frames),
+            "source": self.report_source_label or "Session",
+            "settings": s,
+            "default_logo": PINPOINT_IMAGE_FALLBACK,
+            "map_path": IMAGE_PATH,
+            "map_png_b64": map_png_b64,
+            "app_version": APP_VERSION,
+            "start_time": start_time,
+        }
+
+    # ---------- Playback ----------
+    def _enter_playback(self, frames: list[dict], header: Optional[dict] = None, flags: Optional[list[dict]] = None):
+        self.playback_mode = True
+        self.playback_frames = frames
+        self.playback_flags = list(flags or [])
+        self.playback_index = 0
+        self.playback_speed_factor = 1.0
+        self._playback_playing = False
+        self._playback_last_map_bytes = None
+        self.playback_slider.setMinimum(0)
+        self.playback_slider.setMaximum(max(0, len(frames) - 1))
+        self.playback_slider.setValue(0)
+        total_time = self._frame_time(len(frames) - 1) if frames else 0.0
+        self.playback_slider.set_flags(self.playback_flags, total_time)
+        self.playback_speed.setCurrentText("1x")
+        self.playback_widget.setVisible(True)
+        self.start_btn.setEnabled(False)
+        self.open_recording_btn.setEnabled(False)
+        if hasattr(self, "start_action"):
+            self.start_action.setEnabled(False)
+        if hasattr(self, "open_recording_action"):
+            self.open_recording_action.setEnabled(False)
+        if hasattr(self, "exit_playback_action"):
+            self.exit_playback_action.setEnabled(True)
+        self.image_timer.stop()
+        self._apply_playback_frame(0)
+        self._update_playback_time_label()
+        self._update_info_panel()
+        self._refresh_report_action()
+        self._refresh_map_mode(force=True)
+        if hasattr(self, "api") and self.api:
+            self.api.emit("playback.started", {"ts": time.time(), "frames": len(frames)})
+
+    def _exit_playback(self):
+        if not self.playback_mode:
+            return
+        self._pause_playback()
+        self.playback_mode = False
+        self.playback_frames = []
+        self.playback_flags = []
+        self.playback_index = 0
+        self.playback_widget.setVisible(False)
+        self.start_btn.setEnabled(True)
+        self.open_recording_btn.setEnabled(True)
+        if hasattr(self, "start_action"):
+            self.start_action.setEnabled(True)
+        if hasattr(self, "open_recording_action"):
+            self.open_recording_action.setEnabled(True)
+        if hasattr(self, "exit_playback_action"):
+            self.exit_playback_action.setEnabled(False)
+        self._playback_last_map_bytes = None
+        self.playback_slider.set_flags([], 0.0)
+        self.update_image(force=True)
+        self.image_timer.start()
+        self._update_info_panel()
+        self._refresh_report_action()
+        self._refresh_map_mode(force=True)
+        if hasattr(self, "api") and self.api:
+            self.api.emit("playback.stopped", {"ts": time.time()})
+
+    def _toggle_playback(self):
+        if not self.playback_mode or not self.playback_frames:
+            return
+        if self._playback_playing:
+            self._pause_playback()
+        else:
+            self._start_playback()
+
+    def _start_playback(self):
+        if not self.playback_frames:
+            return
+        self._playback_playing = True
+        self.playback_play_btn.setText("Pause")
+        self._playback_start_wall = time.time()
+        self._playback_start_t = self._frame_time(self.playback_index)
+        self.playback_timer.start()
+
+    def _pause_playback(self):
+        self._playback_playing = False
+        self.playback_play_btn.setText("Play")
+        self.playback_timer.stop()
+
+    def _on_playback_tick(self):
+        if not self._playback_playing or not self.playback_frames:
+            return
+        now = time.time()
+        playback_t = self._playback_start_t + (now - self._playback_start_wall) * self.playback_speed_factor
+        last_idx = len(self.playback_frames) - 1
+        last_t = self._frame_time(last_idx)
+        if playback_t >= last_t:
+            self._set_playback_index(last_idx)
+            self._pause_playback()
+            return
+        # advance index while time passes
+        while self.playback_index < last_idx and self._frame_time(self.playback_index + 1) <= playback_t:
+            self.playback_index += 1
+            self._apply_playback_frame(self.playback_index)
+        self._update_playback_slider()
+        self._update_playback_time_label()
+
+    def _frame_time(self, idx: int) -> float:
+        try:
+            return float(self.playback_frames[idx].get("t", idx))
+        except Exception:
+            return float(idx)
+
+    def _apply_playback_frame(self, idx: int):
+        frame = self.playback_frames[idx]
+        if "map_png" in frame and frame["map_png"]:
+            try:
+                png_bytes = base64.b64decode(frame["map_png"])
+                self._playback_last_map_bytes = png_bytes
+                self._set_map_image_bytes(png_bytes)
+            except Exception:
+                pass
+        elif self._playback_last_map_bytes:
+            self._set_map_image_bytes(self._playback_last_map_bytes)
+        telemetry = frame.get("telemetry") or {}
+        self._apply_telemetry(telemetry)
+        self._refresh_info_dialogs()
+
+    def _set_playback_index(self, idx: int):
+        self.playback_index = max(0, min(idx, len(self.playback_frames) - 1))
+        self._apply_playback_frame(self.playback_index)
+        self._update_playback_slider()
+        self._update_playback_time_label()
+        if self._playback_playing:
+            self._playback_start_wall = time.time()
+            self._playback_start_t = self._frame_time(self.playback_index)
+
+    def _update_playback_slider(self):
+        if self._playback_slider_dragging:
+            return
+        self.playback_slider.blockSignals(True)
+        self.playback_slider.setValue(self.playback_index)
+        self.playback_slider.blockSignals(False)
+
+    def _on_playback_scrub(self, value: int):
+        if not self.playback_frames:
+            return
+        if self._playback_slider_dragging or not self._playback_playing:
+            self._set_playback_index(value)
+
+    def _on_playback_slider_pressed(self):
+        self._playback_slider_dragging = True
+        self._slider_was_playing = self._playback_playing
+        self._pause_playback()
+
+    def _on_playback_slider_released(self):
+        self._playback_slider_dragging = False
+        if getattr(self, "_slider_was_playing", False):
+            self._start_playback()
+
+    def _on_playback_speed_changed(self, text: str):
+        try:
+            self.playback_speed_factor = float(text.replace("x", "").strip())
+        except Exception:
+            self.playback_speed_factor = 1.0
+        if self._playback_playing:
+            self._playback_start_wall = time.time()
+            self._playback_start_t = self._frame_time(self.playback_index)
+        self._update_info_panel()
+
+    def _update_playback_time_label(self):
+        if not self.playback_frames:
+            self.playback_time_label.setText("00:00 / 00:00")
+            return
+        cur = self._frame_time(self.playback_index)
+        total = self._frame_time(len(self.playback_frames) - 1)
+        self.playback_time_label.setText(f"{self._fmt_time(cur)} / {self._fmt_time(total)}")
+
+    def _refresh_info_dialogs(self, force: bool = False) -> None:
+        if self._gps_info_dialog is None and self._antenna_info_dialog is None:
+            return
+        now = time.time()
+        min_interval = 0.15
+        if self.playback_speed_factor >= 16:
+            min_interval = 0.08
+        elif self.playback_speed_factor >= 8:
+            min_interval = 0.1
+        if not force and (now - self._last_info_dialog_refresh) < min_interval:
+            return
+        self._last_info_dialog_refresh = now
+        if self._gps_info_dialog is not None:
+            self._gps_info_dialog.refresh()
+        if self._antenna_info_dialog is not None:
+            self._antenna_info_dialog.refresh()
+
+    @staticmethod
+    def _fmt_time(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        m, s = divmod(seconds, 60)
+        return f"{m:02d}:{s:02d}"
+
+    def _start_collection_thread(self):
+        self.stop_event.clear()
+        self.thread = CollectorThread(logger=logger, stop_event=self.stop_event, gps_port=self.gps_port)
+        self.thread.status.connect(self._on_thread_status)
+        self.thread.error.connect(self._on_thread_error)
+        self.thread.telemetry.connect(self._on_telemetry)
+        self.thread.finished.connect(self._on_thread_finished)
+        self.thread.start()
+
+    def _maybe_prompt_recording(self):
+        dlg = RecordingPromptDialog(self)
+        dlg.exec()
+        if not dlg.result_record:
+            return
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Recording",
+            "session.pinplyr",
+            "Pinpoint Playback (*.pinplyr)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".pinplyr"):
+            path += ".pinplyr"
+        self._start_recording(path)
+
+    def _start_recording(self, path: str):
+        try:
+            with settings_lock:
+                snapshot = settings.to_dict()
+            self.recording_session = RecordingSession(path, settings_snapshot=snapshot, app_version=APP_VERSION)
+            self.recording_path = path
+            logger.info("Recording started: %s", path)
+            self._update_info_panel()
+        except Exception as e:
+            self.recording_session = None
+            self.recording_path = None
+            logger.error("Failed to start recording: %s", e)
+            QtWidgets.QMessageBox.warning(self, "Recording Failed", f"Could not start recording:\n{e}")
+
+    def _stop_recording(self):
+        if self.recording_session is not None:
+            try:
+                self.recording_session.close()
+                logger.info("Recording saved: %s", self.recording_path)
+            except Exception as e:
+                logger.error("Failed to close recording: %s", e)
+            finally:
+                self.recording_session = None
+                self.recording_path = None
+                self._update_info_panel()
+
+    def _show_starting_dialog(self):
+        if self._start_dialog is None:
+            self._start_dialog = BusyDialog(
+                title="Starting",
+                text="Starting Data Collection...",
+                mode="starting",
+                parent=self,
+            )
+        self._start_dialog.show()
+
+    def _hide_starting_dialog(self):
+        if self._start_dialog is not None:
+            self._start_dialog.close()
+            self._start_dialog.deleteLater()
+            self._start_dialog = None
+
+    def _show_stopping_dialog(self):
+        if self._stop_dialog is None:
+            self._stop_dialog = BusyDialog(
+                title="Stopping",
+                text="Stopping Data Collection...",
+                mode="stopping",
+                parent=self,
+            )
+        self._stop_dialog.show()
+
+    def _hide_stopping_dialog(self):
+        if self._stop_dialog is not None:
+            self._stop_dialog.close()
+            self._stop_dialog.deleteLater()
+            self._stop_dialog = None
+
+    def _finish_stop_ui(self):
+        self._hide_stopping_dialog()
+        self._stop_recording()
+        self._finalize_report_cache()
+        self._set_start_state("Start Data Collection", "primary", enabled=True)
+        if hasattr(self, "api") and self.api:
+            self.api.emit("collection.stopped", {"ts": time.time()})
+
+    def _on_telemetry(self, data: dict):
+        if self.recording_session is not None:
+            try:
+                self.recording_session.record_frame(data)
+            except Exception as e:
+                logger.error("Failed to record frame: %s", e)
+        self._cache_report_frame(data)
+        if hasattr(self, "api") and self.api:
+            self.api.emit("telemetry", data)
+        if self.playback_mode:
+            return
+        self._apply_telemetry(data)
+
+    def _apply_telemetry(self, data: dict):
+        gps_fix = data.get("gps_fix")
+        sats = data.get("sats")
+        fix_age = data.get("fix_age_s")
+        strength = data.get("strength")
+        snr = data.get("snr")
+        quality = data.get("quality")
+        satellites = data.get("satellites")
+        sdr_connected = data.get("sdr_connected")
+        sdr_error = data.get("sdr_error")
+        sdr_sample_rate = data.get("sdr_sample_rate")
+        antenna_count = data.get("antenna_count")
+        current_bearing = data.get("current_bearing")
+        target_bearing = data.get("target_bearing")
+        target_relative = data.get("target_relative")
+        antenna_states = data.get("antenna_states")
+        aoa_conf = data.get("aoa_confidence")
+        map_conf = data.get("map_confidence")
+        fusion_conf = data.get("fusion_confidence")
+        bearing_source = data.get("bearing_source")
+        if satellites is not None:
+            self.latest_satellites = satellites
+        if strength is not None:
+            self.latest_strength = strength
+        if snr is not None:
+            self.latest_snr = snr
+        if quality is not None:
+            self.latest_quality = quality
+        if sdr_connected is not None:
+            self.sdr_connected = bool(sdr_connected)
+        if sdr_error is not None:
+            self.sdr_error = sdr_error
+        if sdr_sample_rate is not None:
+            self.sdr_sample_rate = sdr_sample_rate
+        if antenna_count is not None:
+            self.antenna_count = int(antenna_count)
+        if antenna_states is not None:
+            self.antenna_states = antenna_states
+        if current_bearing is not None:
+            self.current_bearing = current_bearing
+        if target_bearing is not None:
+            self.target_bearing = target_bearing
+        if target_relative is not None:
+            self.target_relative = target_relative
+        if aoa_conf is not None:
+            self.aoa_confidence = aoa_conf
+        if map_conf is not None:
+            self.map_confidence = map_conf
+        if fusion_conf is not None:
+            self.fusion_confidence = fusion_conf
+        if bearing_source is not None:
+            self.bearing_source = bearing_source
+        if gps_fix is not None:
+            self.latest_gps_fix = bool(gps_fix)
+        if sats is not None:
+            self.latest_sats = sats
+        if fix_age is not None:
+            self.latest_fix_age = fix_age
+        if gps_fix:
+            self.gps_label.setText(f"GPS: FIX (sats={sats})")
+        else:
+            if fix_age is not None:
+                self.gps_label.setText(f"GPS: last fix {fix_age:.0f}s ago")
+            else:
+                self.gps_label.setText("GPS: no fix")
+        if strength is not None:
+            snr_text = "--" if snr is None else f"{snr:.2f}"
+            self.status_label.setText(f"Status: S={strength}  SNR={snr_text}")
+        self._update_info_panel()
+    def clear_app(self):
+        # Reset map image
+        try:
+            if os.path.exists(PINPOINT_IMAGE_FALLBACK):
+                shutil.copy(PINPOINT_IMAGE_FALLBACK, IMAGE_PATH)
+        except Exception as e:
+            logger.warning(f"Could not copy fallback image: {e}")
+
+        # Reset log file
+        reset_log_file()
+
+        logger.info("Application cleared.")
+        # Force an immediate image update
+        self.update_image(force=True)
+
+    # ---------- Image handling ----------
+    def _set_map_image_bytes(self, png_bytes: bytes):
+        try:
+            if self.map_stack.currentWidget() != self.image_label:
+                self.map_stack.setCurrentWidget(self.image_label)
+            pix = QtGui.QPixmap()
+            if not pix.loadFromData(png_bytes):
+                return
+            label_size = self.image_label.size()
+            pix = pix.scaled(label_size, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
+            self.image_label.setPixmap(pix)
+        except Exception as e:
+            logger.error(f"Error loading playback image: {e}")
+
+    def update_image(self, force: bool = False):
+        try:
+            if self._interactive_map_enabled and not self.playback_mode:
+                self._update_interactive_map(force=force)
+                return
+            if not os.path.exists(IMAGE_PATH):
+                self.image_label.setText("Image not found")
+                return
+            current_mod_time = os.path.getmtime(IMAGE_PATH)
+            if force or current_mod_time != self._last_image_mtime:
+                self._last_image_mtime = current_mod_time
+                # Load via Pillow and scale to the label's current size for responsive UI
+                img = Image.open(IMAGE_PATH)
+                # Determine target size from label while respecting MAX_* caps
+                label_size = self.image_label.size()
+                target_w = min(label_size.width(), MAX_WIDTH)
+                target_h = min(label_size.height(), MAX_HEIGHT)
+                img.thumbnail((target_w, target_h))
+                # Convert to QImage and then pixmap; finally scale pixmap smoothly to label
+                qimg = self._pil_to_qimage(img)
+                pix = QtGui.QPixmap.fromImage(qimg)
+                pix = pix.scaled(label_size, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
+                self.image_label.setPixmap(pix)
+                logger.debug("Image updated.")
+        except Exception as e:
+            logger.error(f"Error loading image: {e}")
+            self.image_label.setText("Image not found")
+
+    def _refresh_map_mode(self, force: bool = False) -> None:
+        token = _get_mapbox_token()
+        should_enable = bool(self.map_view and token) and not self.playback_mode
+        if should_enable and (force or not self._interactive_map_enabled):
+            self._enable_interactive_map()
+        elif not should_enable and (force or self._interactive_map_enabled):
+            self._disable_interactive_map()
+
+    def _enable_interactive_map(self) -> None:
+        if not self.map_view:
+            return
+        self._interactive_map_enabled = True
+        self._map_initialized = False
+        self._map_ready = False
+        self._pending_map_points = None
+        self.map_stack.setCurrentWidget(self.map_view)
+        self._update_interactive_map(force=True)
+
+    def _disable_interactive_map(self) -> None:
+        self._interactive_map_enabled = False
+        self._map_initialized = False
+        self._map_ready = False
+        self._pending_map_points = None
+        self.map_stack.setCurrentWidget(self.image_label)
+
+    def _on_map_load_finished(self, ok: bool) -> None:
+        self._map_ready = bool(ok)
+        if not ok or not self._interactive_map_enabled or not self.map_view:
+            return
+        if self._pending_map_points is None:
+            return
+        points = self._pending_map_points
+        self._pending_map_points = None
+        js = self._build_map_update_js(points)
+        self.map_view.page().runJavaScript(js)
+
+    def _map_points_signature(self, points: list[dict]) -> tuple:
+        if not points:
+            return (0, None)
+        last = points[-1]
+        return (
+            len(points),
+            last.get("t"),
+            last.get("lat"),
+            last.get("lon"),
+            last.get("strength"),
+        )
+
+    def _update_interactive_map(self, force: bool = False) -> None:
+        if not self._interactive_map_enabled or not self.map_view:
+            return
+        token = _get_mapbox_token()
+        if not token:
+            self._disable_interactive_map()
+            return
+        points = self._get_history_points()
+        sig = self._map_points_signature(points)
+        now = time.time()
+        if not force and (sig == self._last_map_sig) and (now - self._last_map_update) < MAP_UPDATE_INTERVAL_S:
+            return
+        self._last_map_sig = sig
+        self._last_map_update = now
+        if not self._map_initialized:
+            html = self._build_map_html(token, points)
+            self._map_ready = False
+            self._pending_map_points = points
+            self.map_view.setHtml(html)
+            self._map_initialized = True
+            return
+        if not self._map_ready:
+            self._pending_map_points = points
+            return
+        js = self._build_map_update_js(points)
+        self.map_view.page().runJavaScript(js)
+
+    def _build_map_html(self, token: str, points: list[dict]) -> str:
+        center = self._map_center(points)
+        zoom = 13 if points else 2
+        points_js = json.dumps(points)
+        center_js = json.dumps(center)
+        token_js = json.dumps(token)
+        return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=yes" />
+  <script src="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"></script>
+  <link href="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css" rel="stylesheet" />
+  <style>
+    html, body, #map {{ height: 100%; margin: 0; padding: 0; }}
+    .pin {{
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      border: 2px solid #ffffff;
+      box-shadow: 0 0 6px rgba(0,0,0,0.35);
+    }}
+    .popup {{
+      font-family: Arial, sans-serif;
+      font-size: 12px;
+    }}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script>
+    mapboxgl.accessToken = {token_js};
+    const map = new mapboxgl.Map({{
+      container: 'map',
+      style: 'mapbox://styles/mapbox/streets-v12',
+      center: {center_js},
+      zoom: {zoom}
+    }});
+    map.addControl(new mapboxgl.NavigationControl());
+    let markers = [];
+    let followMode = true;
+
+    map.on('dragstart', () => {{ followMode = false; }});
+    map.on('zoomstart', () => {{ followMode = false; }});
+    map.on('rotatestart', () => {{ followMode = false; }});
+    map.on('pitchstart', () => {{ followMode = false; }});
+
+    function strengthColor(val) {{
+      const v = Math.max(0, Math.min(1000, Number(val || 0)));
+      const t = v / 1000.0;
+      const r = Math.round(255 * t);
+      const b = Math.round(255 * (1 - t));
+      return `rgb(${{r}}, 0, ${{b}})`;
+    }}
+
+    function popupHtml(p) {{
+      const lat = (p.lat ?? '--');
+      const lon = (p.lon ?? '--');
+      const strength = (p.strength ?? '--');
+      const snr = (p.snr ?? '--');
+      const quality = (p.quality ?? '--');
+      const t = (p.t ?? '--');
+      return `
+        <div class="popup">
+          <div><strong>Lat:</strong> ${{lat}}</div>
+          <div><strong>Lon:</strong> ${{lon}}</div>
+          <div><strong>Strength:</strong> ${{strength}}</div>
+          <div><strong>SNR:</strong> ${{snr}}</div>
+          <div><strong>Quality:</strong> ${{quality}}</div>
+          <div><strong>t:</strong> ${{t}}</div>
+        </div>`;
+    }}
+
+    function clearMarkers() {{
+      markers.forEach(m => m.marker.remove());
+      markers = [];
+    }}
+
+    function addMarkers(data) {{
+      data.forEach(p => {{
+        if (p.lat == null || p.lon == null) return;
+        const el = document.createElement('div');
+        el.className = 'pin';
+        el.style.backgroundColor = strengthColor(p.strength);
+        const marker = new mapboxgl.Marker(el).setLngLat([p.lon, p.lat]).addTo(map);
+        const popup = new mapboxgl.Popup({{ closeButton: false, closeOnClick: false, offset: 18 }})
+          .setLngLat([p.lon, p.lat])
+          .setHTML(popupHtml(p));
+        el.addEventListener('mouseenter', () => popup.addTo(map));
+        el.addEventListener('mouseleave', () => popup.remove());
+        markers.push({{ marker, popup }});
+      }});
+    }}
+
+    function fitBoundsIfNeeded(data) {{
+      if (data.length < 2) return;
+      const bounds = new mapboxgl.LngLatBounds();
+      data.forEach(p => {{
+        if (p.lat == null || p.lon == null) return;
+        bounds.extend([p.lon, p.lat]);
+      }});
+      map.fitBounds(bounds, {{ padding: 50, maxZoom: 16 }});
+    }}
+
+    window.setFollowMode = function(enabled) {{
+      followMode = !!enabled;
+    }};
+
+    window.updateMarkers = function(data, center, forceFollow) {{
+      if (forceFollow) {{
+        followMode = true;
+      }}
+      clearMarkers();
+      addMarkers(data);
+      if (!followMode) return;
+      if (center && center.length === 2) {{
+        map.setCenter(center);
+      }} else {{
+        fitBoundsIfNeeded(data);
+      }}
+    }};
+
+    map.on('load', () => {{
+      window.updateMarkers({points_js}, {center_js}, true);
+    }});
+  </script>
+</body>
+</html>"""
+
+    def _build_map_update_js(self, points: list[dict]) -> str:
+        points_js = json.dumps(points)
+        center_js = json.dumps(self._map_center(points))
+        return f"if (window.updateMarkers) {{ window.updateMarkers({points_js}, {center_js}, false); }}"
+
+    def _map_center(self, points: list[dict]) -> list[float]:
+        if points:
+            last = points[-1]
+            lat = last.get("lat")
+            lon = last.get("lon")
+            if lat is not None and lon is not None:
+                return [float(lon), float(lat)]
+        return [0.0, 0.0]
+
+    @staticmethod
+    def _pil_to_qimage(pil_img: Image.Image) -> QtGui.QImage:
+        if pil_img.mode != "RGBA":
+            pil_img = pil_img.convert("RGBA")
+        data = pil_img.tobytes("raw", "RGBA")
+        qimg = QtGui.QImage(data, pil_img.width, pil_img.height, QtGui.QImage.Format.Format_RGBA8888)
+        return qimg
+
+    # ---------- Lifecycle ----------
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        # Gracefully stop the worker if running
+        try:
+            if self.collecting:
+                self.stop_collection()
+            if hasattr(self, "addon_manager") and self.addon_manager:
+                self.addon_manager.shutdown()
+        finally:
+            logger.info("Exiting application.")
+            super().closeEvent(event)
+

@@ -1,3 +1,5 @@
+"""Meshtastic connectivity add-on."""
+
 
 from __future__ import annotations
 
@@ -8,6 +10,8 @@ import time
 from typing import Optional, Dict, Any, List
 
 from PyQt6 import QtCore, QtWidgets
+
+from pinpoint.plugin_api import AddonAction, AddonPlugin, PinpointAPI
 
 import funcs
 
@@ -736,3 +740,73 @@ class LiveNetworkDataViewer(QtWidgets.QDialog):
         for col, value in enumerate(items):
             self.table.setItem(row, col, QtWidgets.QTableWidgetItem(value))
         self.table.scrollToBottom()
+
+
+def plugin_entry(api: PinpointAPI) -> AddonPlugin:
+    window = api.call("ui.get_main_window").get("window")
+    manager = MeshtasticManager(parent=window)
+
+    def _refresh_actions(*_args):
+        api.call("addons.refresh_actions")
+
+    manager.status_changed.connect(_refresh_actions)
+    manager.link_changed.connect(_refresh_actions)
+
+    def _open_connectivity(_api: PinpointAPI) -> None:
+        if not manager.library_available():
+            api.call(
+                "ui.show_message",
+                {
+                    "title": "Meshtastic Unavailable",
+                    "message": "Install the 'meshtastic' Python package to enable connectivity.",
+                    "level": "warning",
+                },
+            )
+            return
+        if not manager.connected:
+            prompt = MeshtasticReadNodeDialog(manager, window)
+            if prompt.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                return
+        dlg = MeshtasticConnectivityDialog(manager, window)
+        dlg.exec()
+
+    def _open_viewer(_api: PinpointAPI) -> None:
+        if not (manager.enabled and manager.peer_linked):
+            api.call(
+                "ui.show_message",
+                {
+                    "title": "Meshtastic Offline",
+                    "message": "Enable Meshtastic and wait for a peer node before viewing live network data.",
+                    "level": "info",
+                },
+            )
+            return
+        dlg = LiveNetworkDataViewer(manager, window)
+        dlg.exec()
+
+    def _viewer_available(_api: PinpointAPI) -> bool:
+        return bool(manager.enabled and manager.peer_linked)
+
+    def _on_unload(_api: PinpointAPI) -> None:
+        manager.shutdown()
+
+    return AddonPlugin(
+        id="meshtastic_connectivity",
+        name="Meshtastic",
+        version="1.0.0",
+        description="Meshtastic connectivity and live network viewer.",
+        menu=[
+            AddonAction(
+                id="meshtastic_connect",
+                label="Meshtastic Connectivity...",
+                handler=_open_connectivity,
+            ),
+            AddonAction(
+                id="meshtastic_viewer",
+                label="Live Network Data Viewer",
+                handler=_open_viewer,
+                enabled=_viewer_available,
+            ),
+        ],
+        on_unload=_on_unload,
+    )

@@ -1,3 +1,5 @@
+"""History export add-on."""
+
 from __future__ import annotations
 
 import csv
@@ -6,6 +8,7 @@ from typing import Callable, List, Dict
 
 from PyQt6 import QtCore, QtWidgets
 
+from pinpoint.plugin_api import AddonAction, AddonPlugin, PinpointAPI
 
 class HistoryExportDialog(QtWidgets.QDialog):
     def __init__(self, parent, data_provider: Callable[[], List[Dict]]):
@@ -119,3 +122,31 @@ class HistoryExportDialog(QtWidgets.QDialog):
         data = {"type": "FeatureCollection", "features": features}
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+
+
+def _open_history_export(api: PinpointAPI) -> None:
+    parent = api.call("ui.get_main_window").get("window")
+    dlg = HistoryExportDialog(parent, lambda: api.call("data.get_history_points").get("points") or [])
+    dlg.exec()
+
+
+def _history_available(api: PinpointAPI) -> bool:
+    points = api.call("data.get_history_points").get("points") or []
+    return bool(points)
+
+
+def plugin_entry(api: PinpointAPI) -> AddonPlugin:
+    return AddonPlugin(
+        id="history_exporter",
+        name="History Exporter",
+        version="1.0.0",
+        description="Export history points to CSV or GeoJSON.",
+        menu=[
+            AddonAction(
+                id="export_history",
+                label="Export History...",
+                handler=_open_history_export,
+                enabled=_history_available,
+            )
+        ],
+    )

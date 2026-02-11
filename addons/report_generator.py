@@ -1,3 +1,5 @@
+"""Report generator add-on."""
+
 from __future__ import annotations
 
 import base64
@@ -11,6 +13,8 @@ from typing import Dict, List, Optional
 
 from PyQt6 import QtCore, QtGui, QtWidgets, QtPrintSupport
 from PIL import Image
+
+from pinpoint.plugin_api import AddonAction, AddonPlugin, PinpointAPI
 
 
 def _avg(values: List[float]) -> Optional[float]:
@@ -40,15 +44,26 @@ def _chunk_list(items: List[str], size: int) -> List[List[str]]:
 
 def _load_app_version_from_main() -> Optional[str]:
     try:
+        from pinpoint import core as app_core
+
+        return getattr(app_core, "APP_VERSION", None)
+    except Exception:
+        pass
+    try:
+        from pinpoint import version as app_version
+
+        return getattr(app_version, "APP_VERSION", None)
+    except Exception:
+        pass
+    try:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        main_path = os.path.join(base_dir, "main.py")
-        if not os.path.exists(main_path):
-            return None
-        with open(main_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        match = re.search(r'^\s*APP_VERSION\s*=\s*["\']([^"\']+)["\']', content, re.MULTILINE)
-        if match:
-            return match.group(1).strip()
+        version_path = os.path.join(base_dir, "pinpoint", "version.py")
+        if os.path.exists(version_path):
+            with open(version_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            match = re.search(r'^\s*APP_VERSION\s*=\s*["\']([^"\']+)["\']', content, re.MULTILINE)
+            if match:
+                return match.group(1).strip()
     except Exception:
         return None
     return None
@@ -940,3 +955,40 @@ def _resize_image_bytes(data: bytes, max_w: int, max_h: int) -> bytes:
             return out.getvalue()
     except Exception:
         return data
+
+
+def _report_available(api: PinpointAPI) -> bool:
+    return bool(api.call("data.report_available").get("available"))
+
+
+def _open_report_generator(api: PinpointAPI) -> None:
+    if not _report_available(api):
+        api.call(
+            "ui.show_message",
+            {
+                "title": "Report Unavailable",
+                "message": "Stop data collection and ensure a session is cached before generating a report.",
+                "level": "info",
+            },
+        )
+        return
+    parent = api.call("ui.get_main_window").get("window")
+    dlg = ReportGeneratorDialog(parent, lambda: api.call("data.get_report_data").get("data") or {})
+    dlg.exec()
+
+
+def plugin_entry(api: PinpointAPI) -> AddonPlugin:
+    return AddonPlugin(
+        id="report_generator",
+        name="Report Generator",
+        version="1.0.0",
+        description="Generate mission reports from cached sessions.",
+        menu=[
+            AddonAction(
+                id="generate_report",
+                label="Generate Report...",
+                handler=_open_report_generator,
+                enabled=_report_available,
+            )
+        ],
+    )
