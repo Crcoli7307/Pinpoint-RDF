@@ -50,32 +50,32 @@ jobs:
         run: |
           & $env:PYTHON_EXE -m pip install --upgrade pip
           & $env:PYTHON_EXE -m pip install -r requirements.txt
-          & $env:PYTHON_EXE -m pip install pyinstaller
+          & $env:PYTHON_EXE -m pip install nuitka
 
-      - name: Build exe (PyInstaller)
+      - name: Build exe (Nuitka)
         shell: powershell
         run: |
           $cmd = Get-Content compile_command.txt -Raw
           $iconPath = Resolve-Path "app.ico" -ErrorAction SilentlyContinue
           if ($iconPath) {
             $iconPath = $iconPath.Path
-            if ($cmd -match '--icon(=|\s+)') {
-              $cmd = [regex]::Replace($cmd, '--icon(=|\s+)"?([^"\s]+)"?', {
+            if ($cmd -match '--windows-icon-from-ico(=|\s+)') {
+              $cmd = [regex]::Replace($cmd, '--windows-icon-from-ico(=|\s+)"?([^"\s]+)"?', {
                 param($m)
-                return "--icon=`"$iconPath`""
+                return "--windows-icon-from-ico=`"$iconPath`""
               })
             } else {
-              $cmd = "$cmd --icon=`"$iconPath`""
+              $cmd = "$cmd --windows-icon-from-ico=`"$iconPath`""
             }
             Write-Host "Using icon: $iconPath"
           } else {
             Write-Host "app.ico not found; skipping icon override."
           }
-          # Drop --add-data entries for gitignored or missing sources.
-          $cmd = [regex]::Replace($cmd, '--add-data\s+"([^"]+)"', {
+          # Drop --include-data-files/dir entries for gitignored or missing sources.
+          $cmd = [regex]::Replace($cmd, '--include-data-(files|dir)=(\"[^\"]+\"|\S+)', {
             param($m)
-            $pair = $m.Groups[1].Value
-            $src = $pair.Split(';', 2)[0]
+            $pair = $m.Groups[2].Value.Trim('"')
+            $src = $pair.Split('=', 2)[0]
             $ignored = $false
             try {
               git check-ignore -q -- $src
@@ -95,7 +95,7 @@ jobs:
           })
           $cmd = $cmd -replace '\s{2,}', ' '
           $py = $env:PYTHON_EXE
-          $cmd = $cmd -replace '^\s*pyinstaller\b', "`"$py`" -m PyInstaller"
+          $cmd = $cmd -replace '^\s*nuitka\b', "`"$py`" -m nuitka"
           Write-Host "Running: $cmd"
           cmd /c $cmd
 

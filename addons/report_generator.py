@@ -5,6 +5,7 @@ import datetime
 import hashlib
 import math
 import os
+import re
 from io import BytesIO
 from typing import Dict, List, Optional
 
@@ -37,6 +38,22 @@ def _chunk_list(items: List[str], size: int) -> List[List[str]]:
     return [items[i:i + size] for i in range(0, len(items), size)]
 
 
+def _load_app_version_from_main() -> Optional[str]:
+    try:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        main_path = os.path.join(base_dir, "main.py")
+        if not os.path.exists(main_path):
+            return None
+        with open(main_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        match = re.search(r'^\s*APP_VERSION\s*=\s*["\']([^"\']+)["\']', content, re.MULTILINE)
+        if match:
+            return match.group(1).strip()
+    except Exception:
+        return None
+    return None
+
+
 class ReportGeneratorDialog(QtWidgets.QDialog):
     def __init__(self, parent, data_provider):
         super().__init__(parent)
@@ -51,7 +68,7 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
         self._settings = self._data.get("settings") or {}
         self._map_png_b64 = self._data.get("map_png_b64")
         self._start_time = self._parse_start_time(self._data.get("start_time"))
-        self._app_version = self._data.get("app_version") or "v7.5.1-hotfix1"
+        self._app_version = self._data.get("app_version") or _load_app_version_from_main() or "unknown"
 
         self._primary_color = QtGui.QColor("#0f766e")
         self._accent_color = QtGui.QColor("#334155")
