@@ -110,6 +110,49 @@ jobs:
             throw "Build output not found: dist/Pinpoint.exe"
           }
 
+      - name: Sign exe (local certificate)
+        shell: powershell
+        run: |
+          $thumbprint = "A2DD8F69432ECB77BDEDBC4F43156B21F92077AB"
+          $exePath = Resolve-Path "dist/Pinpoint.exe" -ErrorAction Stop
+
+          $signtool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
+          if (-not $signtool) {
+            $candidate = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending | Select-Object -First 1
+            if ($candidate) { $signtool = $candidate.FullName }
+          }
+          if (-not $signtool) {
+            throw "signtool.exe not found. Install Windows SDK on the runner."
+          }
+
+          $machineCert = Get-Item "Cert:\LocalMachine\My\$thumbprint" -ErrorAction SilentlyContinue
+          $userCert = Get-Item "Cert:\CurrentUser\My\$thumbprint" -ErrorAction SilentlyContinue
+          if (-not $machineCert -and -not $userCert) {
+            throw "Code signing certificate $thumbprint not found in LocalMachine or CurrentUser store."
+          }
+
+          $baseArgs = @("sign", "/sha1", $thumbprint, "/fd", "SHA256")
+          if ($machineCert) { $baseArgs += "/sm" }
+
+          $timestampUrl = "http://timestamp.digicert.com"
+          $timestampArgs = $baseArgs + @("/td", "SHA256", "/tr", $timestampUrl, $exePath.Path)
+          Write-Host "Signing with timestamp..."
+          & $signtool @timestampArgs
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Timestamp signing failed; retrying without timestamp..."
+            & $signtool @($baseArgs + @($exePath.Path))
+            if ($LASTEXITCODE -ne 0) {
+              throw "signtool sign failed."
+            }
+          }
+
+          Write-Host "Verifying signature..."
+          & $signtool verify /pa /v $exePath.Path
+          if ($LASTEXITCODE -ne 0) {
+            throw "signtool verify failed."
+          }
+
       - name: Create release and upload exe
         uses: https://git.bjxgj.com/actions/gitea-release-action@v1
         with:
