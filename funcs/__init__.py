@@ -35,7 +35,10 @@ from .map import (
 import requests
 import serial
 from serial.tools import list_ports
-import rtlsdr
+try:
+    import rtlsdr  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    rtlsdr = None
 
 __all__ = [
     'selectRadio',

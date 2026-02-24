@@ -12,7 +12,21 @@ https://nexus.crayton.dev/
 """
 
 import numpy as np
-import rtlsdr
+
+try:
+    import rtlsdr
+    _rtlsdr_import_error = None
+except Exception as exc:  # pragma: no cover - handled at runtime
+    rtlsdr = None
+    _rtlsdr_import_error = exc
+
+
+def _require_rtlsdr():
+    if rtlsdr is None:
+        raise ImportError(
+            "RTL-SDR support is unavailable (failed to import 'rtlsdr'). "
+            "Ensure librtlsdr.dll is present or install pyrtlsdr/pyrtlsdrlib."
+        ) from _rtlsdr_import_error
 
 def selectRadio(index=0):
     """
@@ -21,6 +35,7 @@ def selectRadio(index=0):
         radio (pyrtlsdr.RtlSdr): An instance of the SDR device.
     """
     try:
+        _require_rtlsdr()
         radio = rtlsdr.RtlSdr(index)
         return radio
     except Exception as e:
@@ -97,6 +112,8 @@ def list_sdr_devices():
     Return list of SDR devices with index, name, serial (best-effort).
     """
     devices = []
+    if rtlsdr is None:
+        return devices
     try:
         count = int(rtlsdr.librtlsdr.rtlsdr_get_device_count())
     except Exception:

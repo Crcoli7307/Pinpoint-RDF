@@ -187,7 +187,15 @@ def _ensure_librtlsdr_windows() -> None:
         )
 
 
-_ensure_librtlsdr_windows()
+_SDR_BOOTSTRAP_OK = True
+_SDR_BOOTSTRAP_ERROR = None
+try:
+    _ensure_librtlsdr_windows()
+except Exception as exc:
+    _SDR_BOOTSTRAP_OK = False
+    _SDR_BOOTSTRAP_ERROR = str(exc)
+    if not _is_bundled():
+        raise
 
 # Your data pipeline
 import funcs
@@ -625,6 +633,9 @@ file_handler.setFormatter(file_formatter)
 logger.addHandler(file_handler)
 
 logger.setLevel(LOG_LEVEL)
+
+if _SDR_BOOTSTRAP_ERROR:
+    logger.warning("RTL-SDR bootstrap failed: %s", _SDR_BOOTSTRAP_ERROR)
 
 def reset_log_file() -> None:
     global file_handler
