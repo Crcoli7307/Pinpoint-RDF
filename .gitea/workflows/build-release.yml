@@ -75,6 +75,38 @@ jobs:
           } else {
             Write-Host "app.ico not found; skipping icon override."
           }
+          # Ensure Windows version metadata is set for UAC and version info.
+          $rawVersion = $env:PINPOINT_VERSION
+          if (-not $rawVersion) { $rawVersion = $env:PINPOINT_VERSION_TAG }
+          $major = 0; $minor = 0; $patch = 0; $build = 0
+          if ($rawVersion -match '(\d+)\.(\d+)\.(\d+)') {
+            $major = [int]$matches[1]
+            $minor = [int]$matches[2]
+            $patch = [int]$matches[3]
+          } else {
+            Write-Host "Warning: Could not parse version from '$rawVersion'. Defaulting to 0.0.0.0"
+          }
+          if ($rawVersion -match 'hotfix(\d+)') {
+            $build = [int]$matches[1]
+          }
+          $winVersion = "$major.$minor.$patch.$build"
+          if ($cmd -match '--product-version(=|\s+)') {
+            $cmd = [regex]::Replace($cmd, '--product-version(=|\s+)"?([^"\s]+)"?', {
+              param($m)
+              return "--product-version=`"$winVersion`""
+            })
+          } else {
+            $cmd = "$cmd --product-version=`"$winVersion`""
+          }
+          if ($cmd -match '--file-version(=|\s+)') {
+            $cmd = [regex]::Replace($cmd, '--file-version(=|\s+)"?([^"\s]+)"?', {
+              param($m)
+              return "--file-version=`"$winVersion`""
+            })
+          } else {
+            $cmd = "$cmd --file-version=`"$winVersion`""
+          }
+          Write-Host "Using Windows version: $winVersion"
           # Drop --include-data-files/dir entries for gitignored or missing sources.
           $cmd = [regex]::Replace($cmd, '--include-data-(files|dir)=(\"[^\"]+\"|\S+)', {
             param($m)
