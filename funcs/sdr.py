@@ -41,7 +41,7 @@ def selectRadio(index=0):
     except Exception as e:
         raise Exception(f"Error initializing SDR: {e}")
 
-def readRadio(radio, seconds, frequency, gain=30, close_radio=False, configure=True):
+def readRadio(radio, seconds, frequency, gain=30, close_radio=False, configure=True, max_samples=524288):
     """
     Read samples from the SDR device.
     
@@ -59,7 +59,10 @@ def readRadio(radio, seconds, frequency, gain=30, close_radio=False, configure=T
         radio.gain = gain
     
     try:
-        samples = radio.read_samples(seconds * int(radio.sample_rate))
+        sample_count = max(1, int(float(seconds) * int(radio.sample_rate)))
+        if max_samples is not None:
+            sample_count = min(sample_count, max(1, int(max_samples)))
+        samples = radio.read_samples(sample_count)
         # rtlsdr already returns a NumPy array; avoid an extra copy.
         return samples
     finally:
@@ -103,10 +106,32 @@ def calculateSignalQuality(processed_samples):
         return {"mean": 0.0, "std": 0.0, "snr": 0.0, "quality": 0.0}
     mean_val = float(np.mean(processed_samples))
     std_val = float(np.std(processed_samples))
-    snr = mean_val / std_val if std_val > 0 else 0.0
-    # squash into 0-1 range for stable weighting
-    quality = float(np.clip(np.tanh(snr / 10.0), 0.0, 1.0))
-    return {"mean": mean_val, "std": std_val, "snr": snr, "quality": quality}
+    rms = float(np.sqrt(np.mean(np.square(processed_samples))))
+    noise_rms = max(1e-12, std_val)
+    snr = float(20.0 * np.log10(max(rms, 1e-12) / noise_rms))
+    quality = float(np.clip((snr + 5.0) / 30.0, 0.0, 1.0))
+    power_dbfs = float(20.0 * np.log10(max(rms, 1e-12)))
+    return {
+        "mean": mean_val,
+        "std": std_val,
+        "snr": snr,
+        "quality": quality,
+        "power_dbfs": power_dbfs,
+    }
+
+
+def calculateSpectrum(samples, bins=128, fft_size=4096):
+    """Return a compact, display-ready FFT row without retaining raw captures."""
+    if samples is None or len(samples) == 0:
+        return []
+    size = min(len(samples), max(64, int(fft_size)))
+    segment = np.asarray(samples[:size], dtype=np.complex128)
+    window = np.hanning(size)
+    spectrum = np.fft.fftshift(np.fft.fft(segment * window))
+    magnitude = 20.0 * np.log10(np.maximum(np.abs(spectrum), 1e-12))
+    bins = max(16, int(bins))
+    chunks = np.array_split(magnitude, bins)
+    return [round(float(np.max(chunk)), 2) for chunk in chunks if len(chunk)]
 
 def list_sdr_devices():
     """

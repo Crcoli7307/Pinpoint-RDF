@@ -103,8 +103,10 @@ class DummyRadio:
         self.sample_rate = None
         self.gain = None
         self.closed = False
+        self.last_sample_count = None
 
     def read_samples(self, count):
+        self.last_sample_count = count
         return np.array([1 + 1j, 2 + 2j])
 
     def close(self):
@@ -184,6 +186,12 @@ def test_read_radio_can_reuse_existing_configuration():
     assert radio.sample_rate == 1.0e6
     assert radio.gain == 10
     assert isinstance(samples, np.ndarray)
+
+
+def test_read_radio_caps_capture_size():
+    radio = DummyRadio()
+    sdr.readRadio(radio, seconds=3600, frequency=100.0, max_samples=4096)
+    assert radio.last_sample_count == 4096
 
 
 def test_startup_gps_guess_ignores_unrelated_port(core_module, monkeypatch):
@@ -342,7 +350,10 @@ def test_read_gps_returns_fix(monkeypatch):
         azimuth_4=None,
         snr_4=None,
     )
-    gga = types.SimpleNamespace(sentence_type="GGA", num_sats=7, latitude=12.34, longitude=56.78)
+    gga = types.SimpleNamespace(
+        sentence_type="GGA", num_sats=7, latitude=12.34, longitude=56.78,
+        horizontal_dil=1.4, altitude=123.0,
+    )
     reader = DummyNmeaReader([[gsv, gga]])
     serial_port = DummySerial("COM1", lines=[b"$GPGGA"])
     monkeypatch.setattr(gps.time, "sleep", lambda _s: None)
@@ -351,6 +362,7 @@ def test_read_gps_returns_fix(monkeypatch):
     assert result[1] == pytest.approx(56.78)
     assert result[2] == 7
     assert result[3][0]["prn"] == "1"
+    assert gps.get_gps_metadata(reader)["hdop"] == pytest.approx(1.4)
 
 
 def test_read_gps_returns_rmc_fix(monkeypatch):
@@ -368,7 +380,10 @@ def test_read_gps_returns_rmc_fix(monkeypatch):
 
 
 def test_read_gps_preserves_gsv_details_across_fix_cycles(monkeypatch):
-    gga = types.SimpleNamespace(sentence_type="GGA", num_sats=7, latitude=12.34, longitude=56.78)
+    gga = types.SimpleNamespace(
+        sentence_type="GGA", num_sats=7, latitude=12.34, longitude=56.78,
+        horizontal_dil=1.4, altitude=123.0,
+    )
     gsv = types.SimpleNamespace(
         sentence_type="GSV",
         talker="GP",
@@ -583,6 +598,50 @@ def test_settings_include_map_movement_threshold(core_module):
     assert configured.to_dict()["movement_threshold_m"] == pytest.approx(12.5)
 
 
+def test_adaptive_movement_threshold_uses_gps_accuracy(core_module):
+    snapshot = {
+        "movement_threshold_m": 5.0,
+        "adaptive_movement_pause": True,
+        "movement_accuracy_factor": 2.5,
+    }
+    assert core_module._effective_movement_threshold_m(snapshot, 8.0) == pytest.approx(20.0)
+    snapshot["adaptive_movement_pause"] = False
+    assert core_module._effective_movement_threshold_m(snapshot, 8.0) == pytest.approx(5.0)
+
+
+def test_settings_persist_as_version_tolerant_json(core_module, monkeypatch, tmp_path):
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(core_module, "SETTINGS_FILE", str(settings_path))
+    monkeypatch.setattr(core_module.settings, "movement_threshold_m", 17.5)
+    core_module.save_settings()
+    loaded = core_module._load_settings()
+    assert loaded.movement_threshold_m == pytest.approx(17.5)
+
+
+def test_recording_writer_flushes_frames_before_close(core_module, monkeypatch, tmp_path):
+    recording_path = tmp_path / "session.pinplyr"
+    map_path = tmp_path / "map.png"
+    map_path.write_bytes(_dummy_png_bytes())
+    monkeypatch.setattr(core_module, "IMAGE_PATH", str(map_path))
+    monkeypatch.setattr(core_module, "RECORDING_MAP_INTERVAL_S", 0.0)
+    session = core_module.RecordingSession(str(recording_path), settings_snapshot={})
+    session.record_frame({"strength": 123})
+    session.close()
+    lines = recording_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert '"strength":123' in lines[1]
+
+
+def test_alert_manager_debounces_and_auto_clears(core_module):
+    manager = core_module.AlertManager()
+    manager.update("device", True, "NO SDR", "error", debounce_cycles=2)
+    assert manager.snapshot() == []
+    manager.update("device", True, "NO SDR", "error", debounce_cycles=2)
+    assert manager.snapshot()[0]["message"] == "NO SDR"
+    manager.update("device", False, "NO SDR", "error", debounce_cycles=2)
+    assert manager.snapshot() == []
+
+
 def test_collector_keeps_sdr_configured_and_gps_fixed(core_module, monkeypatch):
     stop_event = threading.Event()
     radio = DummyRadio()
@@ -625,6 +684,10 @@ def test_collector_keeps_sdr_configured_and_gps_fixed(core_module, monkeypatch):
     assert configure_calls == [True, False]
     assert all(update["sdr_connected"] is True for update in updates)
     assert all(update["gps_fix"] is True for update in updates)
+    calculation = updates[0]["calculation_parameters"]
+    assert calculation["configured_settings"]["frequency"] == core_module.settings.frequency
+    assert calculation["effective"]["bearing_method"] == "amplitude-derived"
+    assert calculation["effective"]["antenna_count"] == 1
 
 
 def test_collector_pauses_map_until_movement_reaches_threshold(core_module, monkeypatch):
@@ -733,6 +796,7 @@ def test_change_gps_port_updates_running_collector(monkeypatch):
     import pinpoint.main_window as main_window_mod
 
     requested = []
+    saved = []
 
     class FakeWizard:
         def __init__(self, parent=None, current_port=None):
@@ -744,7 +808,12 @@ def test_change_gps_port_updates_running_collector(monkeypatch):
         def selected_port(self):
             return "COM9"
 
+        def remember_port(self):
+            return True
+
     monkeypatch.setattr(main_window_mod, "GPSSetupWizard", FakeWizard)
+    monkeypatch.setattr(main_window_mod, "save_settings", lambda: saved.append(True))
+    monkeypatch.setattr(main_window_mod.settings, "preferred_gps_port", "COM7")
     monitor = types.SimpleNamespace(gps_port="COM7")
     collector = types.SimpleNamespace(request_gps_port=lambda port: requested.append(port))
     refreshed = []
@@ -776,9 +845,59 @@ def test_change_gps_port_updates_running_collector(monkeypatch):
     assert window.gps_port == "COM9"
     assert monitor.gps_port == "COM9"
     assert requested == ["COM9"]
+    assert main_window_mod.settings.preferred_gps_port == "COM9"
+    assert saved == [True]
     assert window.latest_gps_fix is False
     assert window._idle_gps_point is None
     assert ("map", True) in refreshed
+
+
+def test_gps_setup_wizard_remember_checkbox_value():
+    from pinpoint.ui_components import GPSSetupWizard
+
+    wizard = types.SimpleNamespace(
+        remember_checkbox=types.SimpleNamespace(isChecked=lambda: True),
+    )
+    assert GPSSetupWizard.remember_port(wizard) is True
+
+
+def test_startup_manual_gps_selection_captures_remember_choice(monkeypatch):
+    import pinpoint.ui_components as ui_components
+
+    started = []
+
+    class FakeWizard:
+        def __init__(self, parent=None, current_port=None):
+            assert current_port == "COM7"
+
+        def exec(self):
+            return ui_components.QtWidgets.QDialog.DialogCode.Accepted
+
+        def selected_port(self):
+            return "COM9"
+
+        def remember_port(self):
+            return True
+
+    monkeypatch.setenv("GPS_PORT", "COM7")
+    monkeypatch.setattr(ui_components, "GPSSetupWizard", FakeWizard)
+    monkeypatch.setattr(
+        ui_components.QtCore.QTimer,
+        "singleShot",
+        lambda _delay, callback: callback(),
+    )
+    dialog = types.SimpleNamespace(
+        _selected_port=None,
+        _remember_port=False,
+        _start_fix_wait=lambda: started.append(True),
+        reject=lambda: None,
+    )
+
+    ui_components.GPSStartupDialog._open_wizard(dialog)
+
+    assert dialog._selected_port == "COM9"
+    assert dialog._remember_port is True
+    assert started == [True]
 
 
 def test_idle_gps_point_is_not_part_of_active_collection():
@@ -790,7 +909,11 @@ def test_idle_gps_point_is_not_part_of_active_collection():
         collecting=False,
         playback_mode=False,
     )
-    assert MainWindow._get_history_points(window) == [window._idle_gps_point]
+    points = MainWindow._get_history_points(window)
+    assert len(points) == 1
+    assert points[0]["point_id"] == "idle-current"
+    assert points[0]["lat"] == 12.34
+    assert window._map_point_details["idle-current"]["telemetry"]["lon"] == 56.78
 
     window.collecting = True
     assert MainWindow._get_history_points(window) == []
@@ -818,6 +941,8 @@ def test_paused_cycles_are_kept_out_of_interactive_map_history():
 
     points = MainWindow._get_history_points(window)
     assert [(point["lat"], point["lon"]) for point in points] == [(1.0, 2.0)]
+    point_id = points[0]["point_id"]
+    assert window._map_point_details[point_id]["telemetry"]["strength"] == 100
 
 
 def test_interactive_map_urgent_alert_states():
@@ -870,6 +995,44 @@ def test_interactive_map_html_contains_alert_overlay():
     assert 'id="system-alerts"' in html
     assert ".system-alert" in html
     assert 'true, ["NO FIX", "NO SDR"]' in html
+
+
+def test_interactive_map_html_selects_points_through_webchannel():
+    from pinpoint.main_window import MainWindow
+
+    window = types.SimpleNamespace(
+        _map_center=lambda _points: [0.0, 0.0],
+        _get_map_alerts=lambda: [],
+    )
+    html = MainWindow._build_map_html(
+        window,
+        "token",
+        [{"point_id": "fix:1", "lat": 1.0, "lon": 2.0}],
+    )
+    assert "qrc:///qtwebchannel/qwebchannel.js" in html
+    assert "pointBridge.selectPoint(selectedPointId)" in html
+    assert "p.point_id" in html
+
+
+def test_map_point_bridge_forwards_marker_selection():
+    from pinpoint.main_window import _MapPointBridge
+
+    selected = []
+    bridge = _MapPointBridge()
+    bridge.point_selected.connect(selected.append)
+    bridge.selectPoint("fix:42")
+    assert selected == ["fix:42"]
+
+
+def test_static_point_projection_keeps_single_point_centered():
+    from pinpoint.main_window import MainWindow
+
+    point = {"point_id": "one", "lat": 35.0, "lon": -80.0}
+    positions = MainWindow._static_point_positions([point])
+    assert len(positions) == 1
+    assert positions[0][0] is point
+    assert positions[0][1] == pytest.approx(0.5)
+    assert positions[0][2] == pytest.approx(0.5)
 
 
 def test_report_cycle_marks_insufficient_movement_pause():
@@ -928,6 +1091,18 @@ def test_predict_transmitter_location_dead_zone():
     logger = logging.getLogger("test")
     with pytest.raises(ValueError):
         map_mod.predictTransmitterLocation(history, logger)
+
+
+def test_transmitter_estimate_includes_confidence_radius():
+    history = {
+        (35.0, -80.0): {"strength": 500, "quality": 0.9},
+        (35.001, -80.0): {"strength": 400, "quality": 0.8},
+        (35.0, -80.001): {"strength": 300, "quality": 0.7},
+    }
+    estimate = map_mod.estimateTransmitterLocation(history, logging.getLogger("test"))
+    assert estimate["radius_m"] >= 10.0
+    assert 0.0 <= estimate["confidence"] <= 1.0
+    assert estimate["point_count"] == 3
 
 
 def test_map_function_offline(tmp_path):

@@ -27,11 +27,17 @@ class SettingsDialog(QtWidgets.QDialog):
         self.freq_input = QtWidgets.QLineEdit()
         self.gain_input = QtWidgets.QLineEdit()
         self.time_input = QtWidgets.QLineEdit()
+        self.sample_window_input = QtWidgets.QLineEdit()
         self.antenna_input = QtWidgets.QLineEdit()
         self.spacing_input = QtWidgets.QLineEdit()
         self.spacing_mode = QtWidgets.QComboBox()
         self.refresh_input = QtWidgets.QLineEdit()
         self.movement_threshold_input = QtWidgets.QLineEdit()
+        self.movement_accuracy_factor_input = QtWidgets.QLineEdit()
+        self.gps_accuracy_floor_input = QtWidgets.QLineEdit()
+        self.adaptive_movement_checkbox = QtWidgets.QCheckBox("Use GPS accuracy to increase movement threshold")
+        self.orientation_input = QtWidgets.QLineEdit()
+        self.alert_debounce_input = QtWidgets.QLineEdit()
         self.profile_input = QtWidgets.QLineEdit()
         self.aoa_weight_input = QtWidgets.QLineEdit()
         self.map_weight_input = QtWidgets.QLineEdit()
@@ -43,10 +49,14 @@ class SettingsDialog(QtWidgets.QDialog):
         self.freq_input.setValidator(QtGui.QDoubleValidator(bottom=0.0))
         self.gain_input.setValidator(QtGui.QIntValidator(0, 1000))
         self.time_input.setValidator(QtGui.QIntValidator(1, 3600))
+        self.sample_window_input.setValidator(QtGui.QDoubleValidator(0.01, 2.0, 3))
         self.antenna_input.setValidator(QtGui.QIntValidator(1, 16))
         self.spacing_input.setValidator(QtGui.QDoubleValidator(0.0, 1000.0, 2))
         self.refresh_input.setValidator(QtGui.QIntValidator(1, 60))
         self.movement_threshold_input.setValidator(QtGui.QDoubleValidator(0.0, 100000.0, 2))
+        self.movement_accuracy_factor_input.setValidator(QtGui.QDoubleValidator(0.0, 10.0, 2))
+        self.gps_accuracy_floor_input.setValidator(QtGui.QDoubleValidator(0.0, 1000.0, 2))
+        self.alert_debounce_input.setValidator(QtGui.QIntValidator(1, 20))
         self.aoa_weight_input.setValidator(QtGui.QDoubleValidator(0.0, 1.0, 2))
         self.map_weight_input.setValidator(QtGui.QDoubleValidator(0.0, 1.0, 2))
         self.conf_threshold_input.setValidator(QtGui.QDoubleValidator(0.0, 1.0, 2))
@@ -55,10 +65,16 @@ class SettingsDialog(QtWidgets.QDialog):
             self.freq_input.setText(str(settings.frequency))
             self.gain_input.setText(str(settings.gain))
             self.time_input.setText(str(settings.collection_time))
+            self.sample_window_input.setText(str(settings.sample_window_s))
             self.antenna_input.setText(str(settings.antenna_count))
             self.spacing_input.setText("" if not settings.antenna_spacing_in else str(settings.antenna_spacing_in))
             self.refresh_input.setText(str(settings.info_refresh_s))
             self.movement_threshold_input.setText(str(settings.movement_threshold_m))
+            self.movement_accuracy_factor_input.setText(str(settings.movement_accuracy_factor))
+            self.gps_accuracy_floor_input.setText(str(settings.gps_accuracy_floor_m))
+            self.adaptive_movement_checkbox.setChecked(bool(settings.adaptive_movement_pause))
+            self.orientation_input.setText(", ".join(str(v) for v in settings.antenna_orientations_deg))
+            self.alert_debounce_input.setText(str(settings.alert_debounce_cycles))
             self.profile_input.setText(str(settings.calibration_profile))
             self.aoa_weight_input.setText(str(settings.fusion_aoa_weight))
             self.map_weight_input.setText(str(settings.fusion_map_weight))
@@ -74,7 +90,8 @@ class SettingsDialog(QtWidgets.QDialog):
         form = QtWidgets.QFormLayout()
         form.addRow("Frequency (MHz)", self.freq_input)
         form.addRow("Gain", self.gain_input)
-        form.addRow("Collection Time (s)", self.time_input)
+        form.addRow("Collection Cycle (s)", self.time_input)
+        form.addRow("SDR Sample Window (s, max 2)", self.sample_window_input)
         form.addRow("Antenna Count", self.antenna_input)
         self.spacing_mode.addItems(
             [
@@ -90,8 +107,13 @@ class SettingsDialog(QtWidgets.QDialog):
         form.addRow("Antenna Spacing (in)", self.spacing_input)
         form.addRow("Info Refresh (s)", self.refresh_input)
         form.addRow("Map Movement Threshold (m, 0=off)", self.movement_threshold_input)
+        form.addRow("Adaptive Movement", self.adaptive_movement_checkbox)
+        form.addRow("GPS Accuracy Multiplier", self.movement_accuracy_factor_input)
+        form.addRow("GPS Accuracy Floor (m)", self.gps_accuracy_floor_input)
+        form.addRow("Antenna Orientations (deg CSV)", self.orientation_input)
+        form.addRow("Alert Debounce (cycles)", self.alert_debounce_input)
         form.addRow("Calibration Profile", self.profile_input)
-        form.addRow("Fusion Weight (AoA)", self.aoa_weight_input)
+        form.addRow("Fusion Weight (Amplitude)", self.aoa_weight_input)
         form.addRow("Fusion Weight (Map)", self.map_weight_input)
         form.addRow("Mapbox API Token", self.mapbox_input)
         form.addRow("Confidence Threshold", self.conf_threshold_input)
@@ -118,10 +140,21 @@ class SettingsDialog(QtWidgets.QDialog):
             freq = float(self.freq_input.text())
             gain = int(self.gain_input.text())
             ctime = int(self.time_input.text())
+            sample_window_s = float(self.sample_window_input.text())
             antenna_count = int(self.antenna_input.text())
             spacing_in = self._resolve_spacing_in(freq)
             refresh_s = int(self.refresh_input.text())
             movement_threshold_m = float(self.movement_threshold_input.text())
+            movement_accuracy_factor = float(self.movement_accuracy_factor_input.text())
+            gps_accuracy_floor_m = float(self.gps_accuracy_floor_input.text())
+            orientations = []
+            if self.orientation_input.text().strip():
+                orientations = [
+                    float(value.strip()) % 360.0
+                    for value in self.orientation_input.text().split(",")
+                    if value.strip()
+                ]
+            alert_debounce_cycles = int(self.alert_debounce_input.text())
             profile = self.profile_input.text().strip() or "default"
             aoa_weight = float(self.aoa_weight_input.text())
             map_weight = float(self.map_weight_input.text())
@@ -131,10 +164,16 @@ class SettingsDialog(QtWidgets.QDialog):
                 settings.frequency = freq
                 settings.gain = gain
                 settings.collection_time = ctime
+                settings.sample_window_s = max(0.01, min(2.0, sample_window_s))
                 settings.antenna_count = antenna_count
                 settings.antenna_spacing_in = max(0.0, spacing_in)
                 settings.info_refresh_s = refresh_s
                 settings.movement_threshold_m = max(0.0, movement_threshold_m)
+                settings.adaptive_movement_pause = self.adaptive_movement_checkbox.isChecked()
+                settings.movement_accuracy_factor = max(0.0, movement_accuracy_factor)
+                settings.gps_accuracy_floor_m = max(0.0, gps_accuracy_floor_m)
+                settings.antenna_orientations_deg = orientations
+                settings.alert_debounce_cycles = max(1, alert_debounce_cycles)
                 settings.calibration_profile = profile
                 settings.fusion_aoa_weight = aoa_weight
                 settings.fusion_map_weight = map_weight
@@ -142,6 +181,11 @@ class SettingsDialog(QtWidgets.QDialog):
                 settings.auto_tune_fusion = auto_tune
             if not MAPBOX_TOKEN:
                 set_mapbox_token_override(self.mapbox_input.text().strip())
+            profiles = _load_calibration_profiles()
+            with calibration_lock:
+                calibration_data.clear()
+                calibration_data.update(profiles.get(profile, {}))
+            save_settings()
             logger.info(f"Settings updated: {settings.to_dict()}")
             self.accept()
         except ValueError:
@@ -829,8 +873,15 @@ class AntennaInfoDialog(QtWidgets.QDialog):
             "Sample Rate": QtWidgets.QLabel("--"),
             "Signal Quality": QtWidgets.QLabel("--"),
             "SNR": QtWidgets.QLabel("--"),
+            "Power": QtWidgets.QLabel("--"),
             "Antenna Position": QtWidgets.QLabel("--"),
             "SDR Health": QtWidgets.QLabel("--"),
+            "Health Reason": QtWidgets.QLabel("--"),
+            "Read Latency": QtWidgets.QLabel("--"),
+            "Samples": QtWidgets.QLabel("--"),
+            "Last Success": QtWidgets.QLabel("--"),
+            "Failures": QtWidgets.QLabel("--"),
+            "Reconnects": QtWidgets.QLabel("--"),
             "Last Error": QtWidgets.QLabel("--"),
         }
         for key, label in self.detail_labels.items():
@@ -919,8 +970,13 @@ class AntennaInfoDialog(QtWidgets.QDialog):
             fusion_conf = info.get("fusion_confidence")
             bearing_source = info.get("bearing_source")
             profile_name = info.get("calibration_profile")
+            configured_angles = info.get("antenna_orientations_deg") or []
 
-            angles = self._angles(antenna_count)
+            angles = (
+                [float(v) % 360.0 for v in configured_angles[:antenna_count]]
+                if len(configured_angles) >= antenna_count
+                else self._angles(antenna_count)
+            )
             antenna_states = []
             if raw_states:
                 for i, state in enumerate(raw_states):
@@ -935,6 +991,14 @@ class AntennaInfoDialog(QtWidgets.QDialog):
                             "strength": state.get("strength"),
                             "snr": state.get("snr"),
                             "quality": state.get("quality"),
+                            "power_dbfs": state.get("power_dbfs"),
+                            "health": state.get("health"),
+                            "health_reason": state.get("health_reason"),
+                            "read_latency_ms": state.get("read_latency_ms"),
+                            "sample_count": state.get("sample_count"),
+                            "last_success_ts": state.get("last_success_ts"),
+                            "consecutive_failures": state.get("consecutive_failures", 0),
+                            "reconnect_count": state.get("reconnect_count", 0),
                             "position": self._position_label(angles[i]),
                         }
                     )
@@ -964,7 +1028,7 @@ class AntennaInfoDialog(QtWidgets.QDialog):
             if aoa_conf is not None and map_conf is not None and fusion_conf is not None:
                 source_text = (bearing_source or "--").upper()
                 self.meta_label.setText(
-                    f"Calibration: {profile_name or '--'}  |  Source: {source_text}  |  AoA Conf: {aoa_conf:.2f}  |  Map Conf: {map_conf:.2f}  |  Fusion Conf: {fusion_conf:.2f}"
+                    f"Calibration: {profile_name or '--'}  |  Source: {source_text}  |  Amplitude Conf: {aoa_conf:.2f}  |  Map Conf: {map_conf:.2f}  |  Fusion Conf: {fusion_conf:.2f}"
                 )
             else:
                 self.meta_label.setText(f"Calibration: {profile_name or '--'}")
@@ -1025,7 +1089,7 @@ class AntennaInfoDialog(QtWidgets.QDialog):
             spark.set_data(self._spark_history.get(row, []))
             self.table.setCellWidget(row, 3, spark)
 
-            status = "Connected" if state.get("connected") else "Disconnected"
+            status = state.get("health") or ("Connected" if state.get("connected") else "Disconnected")
             self.table.setItem(row, 4, QtWidgets.QTableWidgetItem(status))
 
         if selected is not None and 0 <= selected < len(antenna_states):
@@ -1052,13 +1116,28 @@ class AntennaInfoDialog(QtWidgets.QDialog):
         quality = state.get("quality")
         sample_rate = state.get("sample_rate")
         sdr_error = state.get("error")
-        health = self._health_status(connected, strength, snr, quality)
+        health = state.get("health") or self._health_status(connected, strength, snr, quality)
         self.detail_labels["Connection"].setText("Connected" if connected else "Disconnected")
         self.detail_labels["Sample Rate"].setText("--" if sample_rate is None else f"{sample_rate:.0f} Hz")
         self.detail_labels["Signal Quality"].setText("--" if quality is None else f"{quality:.2f}")
         self.detail_labels["SNR"].setText("--" if snr is None else f"{snr:.2f}")
+        power_dbfs = state.get("power_dbfs")
+        self.detail_labels["Power"].setText("--" if power_dbfs is None else f"{power_dbfs:.1f} dBFS")
         self.detail_labels["Antenna Position"].setText(state.get("position") or "--")
         self.detail_labels["SDR Health"].setText(health)
+        self.detail_labels["Health Reason"].setText(state.get("health_reason") or "--")
+        latency = state.get("read_latency_ms")
+        self.detail_labels["Read Latency"].setText("--" if latency is None else f"{latency:.1f} ms")
+        sample_count = state.get("sample_count")
+        self.detail_labels["Samples"].setText("--" if sample_count is None else f"{int(sample_count):,}")
+        last_success = state.get("last_success_ts")
+        if last_success is None:
+            last_success_text = "--"
+        else:
+            last_success_text = f"{max(0.0, time.time() - float(last_success)):.1f}s ago"
+        self.detail_labels["Last Success"].setText(last_success_text)
+        self.detail_labels["Failures"].setText(str(state.get("consecutive_failures", 0)))
+        self.detail_labels["Reconnects"].setText(str(state.get("reconnect_count", 0)))
         self.detail_labels["Last Error"].setText("--" if not sdr_error else str(sdr_error))
         self.detail_frame.setVisible(True)
 
@@ -1080,6 +1159,12 @@ class GPSSetupWizard(QtWidgets.QDialog):
         self.desc_label = QtWidgets.QLabel("")
         self.desc_label.setWordWrap(True)
         self.refresh_btn = QtWidgets.QPushButton("Refresh")
+        self.remember_checkbox = QtWidgets.QCheckBox("Remember COM Port")
+        self.remember_checkbox.setChecked(False)
+        self.remember_checkbox.setToolTip(
+            "Save the selected GPS port as the default for future launches. "
+            "Leave unchecked to use it for this run only."
+        )
 
         self.refresh_btn.clicked.connect(self._load_ports)
         self.port_combo.currentIndexChanged.connect(self._update_desc)
@@ -1098,6 +1183,7 @@ class GPSSetupWizard(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(self.refresh_btn, alignment=QtCore.Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.remember_checkbox)
         layout.addWidget(btns)
 
         self._ports = []
@@ -1137,6 +1223,9 @@ class GPSSetupWizard(QtWidgets.QDialog):
     def selected_port(self) -> Optional[str]:
         info = self.selected_port_info()
         return info.get("device") if info else None
+
+    def remember_port(self) -> bool:
+        return bool(self.remember_checkbox.isChecked())
 
 
 class BusyDialog(QtWidgets.QDialog):
@@ -1605,6 +1694,7 @@ class GPSStartupDialog(QtWidgets.QDialog):
         self._timeout_s = timeout_s
         self._start_time = None
         self._selected_port: Optional[str] = None
+        self._remember_port = False
         self._last_error = None
         self._calibration_done = False
         self._calibration = {}
@@ -1732,11 +1822,17 @@ class GPSStartupDialog(QtWidgets.QDialog):
             QtCore.QTimer.singleShot(300, self._open_wizard)
 
     def _open_wizard(self):
-        wizard = GPSSetupWizard(self)
+        with settings_lock:
+            preferred_port = settings.preferred_gps_port
+        wizard = GPSSetupWizard(
+            self,
+            current_port=self._selected_port or os.environ.get("GPS_PORT") or preferred_port,
+        )
         if wizard.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             port = wizard.selected_port()
             if port:
                 self._selected_port = port
+                self._remember_port = wizard.remember_port()
                 QtCore.QTimer.singleShot(0, self._start_fix_wait)
                 return
         # If user cancels, keep app running but without a selected GPS port.
@@ -1810,11 +1906,15 @@ class GPSStartupDialog(QtWidgets.QDialog):
     def _on_fix_error(self, error: Exception) -> None:
         self._last_error = error
         self._selected_port = None
+        self._remember_port = False
         self._set_status("No GPS data received. Choose the GPS port manually.", mode="gps")
         QtCore.QTimer.singleShot(500, self._open_wizard)
 
     def selected_port(self) -> Optional[str]:
         return self._selected_port
+
+    def remember_port(self) -> bool:
+        return bool(self._remember_port)
 
     def calibration(self) -> dict:
         return dict(self._calibration or {})

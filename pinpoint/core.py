@@ -25,8 +25,10 @@ import tempfile
 import base64
 import datetime
 import multiprocessing
+import queue
+import concurrent.futures
 from logging.handlers import RotatingFileHandler
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields
 from typing import Callable, Optional
 
 from .version import APP_VERSION
@@ -151,17 +153,8 @@ def _ensure_librtlsdr_windows() -> None:
             "(e.g., via pyrtlsdrlib) and rebuild."
         )
 
-    # Attempt to install the bundled DLL package on Windows.
-    try:
-        import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pyrtlsdrlib"])
-    except Exception as e:
-        raise ImportError(
-            "Failed to install 'pyrtlsdrlib' needed for librtlsdr on Windows. "
-            "Please install it manually and re-run."
-        ) from e
-
-    # Add the pyrtlsdrlib folder(s) to the DLL search path / PATH
+    # Never mutate the Python environment during application import. Use an
+    # already-installed pyrtlsdrlib package when one is available.
     try:
         import importlib
         from pathlib import Path
@@ -182,7 +175,7 @@ def _ensure_librtlsdr_windows() -> None:
     # Final attempt to load librtlsdr
     if not _try_import():
         raise ImportError(
-            "librtlsdr still failed to load after installing 'pyrtlsdrlib'. "
+            "librtlsdr failed to load. Install 'pyrtlsdrlib' and restart. "
             "Ensure the DLL is on PATH or set RTLSDR_LIBRARY_PATH."
         )
 
@@ -194,8 +187,6 @@ try:
 except Exception as exc:
     _SDR_BOOTSTRAP_OK = False
     _SDR_BOOTSTRAP_ERROR = str(exc)
-    if not _is_bundled():
-        raise
 
 # Your data pipeline
 import funcs
@@ -435,40 +426,77 @@ class RecordingSession:
         self.path = path
         self.start_time = time.time()
         self.last_map_mtime: Optional[float] = None
+        self.last_map_embed_time = 0.0
+        self.dropped_frames = 0
+        self._closed = False
+        self._queue: queue.Queue = queue.Queue(maxsize=512)
         self._fh = open(path, "w", encoding="utf-8")
         header = {
             "type": "pinplyr",
-            "version": 1,
+            "version": 2,
             "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
             "app": APP_TITLE,
             "app_version": app_version or APP_VERSION,
             "settings": settings_snapshot or {},
         }
         self._write_line(header)
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            name="PinpointRecordingWriter",
+            daemon=True,
+        )
+        self._writer_thread.start()
 
     def _write_line(self, obj: dict) -> None:
         self._fh.write(json.dumps(obj, separators=(",", ":")) + "\n")
         self._fh.flush()
 
+    def _enqueue(self, item: tuple) -> None:
+        if self._closed:
+            return
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            self.dropped_frames += 1
+
+    def _writer_loop(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                self._queue.task_done()
+                break
+            kind, payload = item
+            try:
+                if kind == "frame":
+                    map_b64 = None
+                    try:
+                        if os.path.exists(IMAGE_PATH):
+                            mtime = os.path.getmtime(IMAGE_PATH)
+                            if (
+                                self.last_map_mtime != mtime
+                                and time.time() - self.last_map_embed_time >= RECORDING_MAP_INTERVAL_S
+                            ):
+                                with open(IMAGE_PATH, "rb") as f:
+                                    map_b64 = base64.b64encode(f.read()).decode("ascii")
+                                self.last_map_mtime = mtime
+                                self.last_map_embed_time = time.time()
+                    except Exception:
+                        map_b64 = None
+                    if map_b64:
+                        payload["map_png"] = map_b64
+                self._write_line(payload)
+            except Exception:
+                logging.getLogger().exception("Failed to write recording item.")
+            finally:
+                self._queue.task_done()
+
     def record_frame(self, telemetry: dict) -> None:
         t = time.time() - self.start_time
-        map_b64 = None
-        try:
-            if os.path.exists(IMAGE_PATH):
-                mtime = os.path.getmtime(IMAGE_PATH)
-                if self.last_map_mtime != mtime:
-                    with open(IMAGE_PATH, "rb") as f:
-                        map_b64 = base64.b64encode(f.read()).decode("ascii")
-                    self.last_map_mtime = mtime
-        except Exception:
-            map_b64 = None
         frame = {
             "t": round(t, 3),
-            "telemetry": telemetry,
+            "telemetry": dict(telemetry),
         }
-        if map_b64:
-            frame["map_png"] = map_b64
-        self._write_line(frame)
+        self._enqueue(("frame", frame))
 
     def record_flag(self, reason: str, note: str = "") -> None:
         t = time.time() - self.start_time
@@ -479,13 +507,20 @@ class RecordingSession:
             "note": note,
             "ts": time.time(),
         }
-        self._write_line(flag)
+        self._enqueue(("flag", flag))
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         try:
+            self._queue.put(None, timeout=2.0)
+            self._writer_thread.join(timeout=5.0)
+            if self._writer_thread.is_alive():
+                logging.getLogger().warning("Recording writer did not stop within timeout.")
             self._fh.close()
         except Exception:
-            pass
+            logging.getLogger().warning("Failed to close recording cleanly.", exc_info=True)
 def _load_env_file(path: str) -> None:
     if not os.path.exists(path):
         return
@@ -541,9 +576,23 @@ def _env_float(name: str, default: float) -> float:
 
 APP_TITLE = "PINPOINT Direction Finding"
 APP_ICON_PATH = _resource_path("app.ico")
-IMAGE_PATH = "map.png"
+
+
+def _get_app_data_dir() -> str:
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        path = os.path.join(base, "Pinpoint")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+        path = os.path.join(base, "pinpoint")
+    os.makedirs(path, exist_ok=True)
+    return os.path.abspath(path)
+
+
+APP_DATA_DIR = _get_app_data_dir()
+IMAGE_PATH = os.path.join(APP_DATA_DIR, "map.png")
 PINPOINT_IMAGE_FALLBACK = _resource_path("pinpoint.png")  # used by Clear App
-LOG_FILE = "main.log"
+LOG_FILE = os.path.join(APP_DATA_DIR, "main.log")
 MAX_WIDTH = 800
 MAX_HEIGHT = 600
 MAP_UPDATE_INTERVAL_S = 3.0
@@ -551,14 +600,20 @@ MAPBOX_URL_MAX = _env_int("MAPBOX_URL_MAX", 1800)
 HISTORY_MAX_POINTS = _env_int("HISTORY_MAX_POINTS", 150)
 HISTORY_MAX_AGE_S = _env_float("HISTORY_MAX_AGE_S", 3600.0)
 REPORT_CACHE_MAX_FRAMES = _env_int("REPORT_CACHE_MAX_FRAMES", 5000)
+PLAYBACK_MAX_FRAMES = _env_int("PLAYBACK_MAX_FRAMES", 50000)
+RECORDING_MAP_INTERVAL_S = _env_float("RECORDING_MAP_INTERVAL_S", 30.0)
 GPS_MAX_WAIT_S = 10
+COLLECTOR_GPS_MAX_WAIT_S = _env_float("COLLECTOR_GPS_MAX_WAIT_S", 1.0)
 GPS_FIX_STALE_S = _env_float("GPS_FIX_STALE_S", 15.0)
 SDR_SCAN_INTERVAL_S = 5.0
 SDR_DEFAULT_SAMPLE_RATE = 2.048e6
+SDR_MAX_SAMPLES = _env_int("SDR_MAX_SAMPLES", 524288)
+MAX_PARALLEL_SDR_READERS = _env_int("MAX_PARALLEL_SDR_READERS", 8)
 HARDWARE_CHECK_TIMEOUT_S = 6.0
 CALIBRATION_SAMPLE_SECONDS = 0.5
 CALIBRATION_TIMEOUT_S = 8.0
-CALIBRATION_FILE = "calibration_profiles.json"
+CALIBRATION_FILE = os.path.join(APP_DATA_DIR, "calibration_profiles.json")
+SETTINGS_FILE = os.path.join(APP_DATA_DIR, "settings.json")
 LOADING_ANIM_GENERAL = _resource_path("assets", "gifs", "general.gif")
 LOADING_ANIM_CHECKING = _resource_path("assets", "gifs", "checking.gif")
 LOADING_ANIM_CAL = _resource_path("assets", "gifs", "calibrating.gif")
@@ -584,6 +639,20 @@ FLAG_REASON_OPTIONS = [
     "Operator Note",
     "Other",
 ]
+
+if not os.path.exists(IMAGE_PATH) and os.path.exists(PINPOINT_IMAGE_FALLBACK):
+    try:
+        shutil.copy2(PINPOINT_IMAGE_FALLBACK, IMAGE_PATH)
+    except OSError:
+        pass
+
+if not os.path.exists(CALIBRATION_FILE):
+    legacy_calibration = _resource_path("calibration_profiles.json")
+    if os.path.exists(legacy_calibration) and os.path.abspath(legacy_calibration) != CALIBRATION_FILE:
+        try:
+            shutil.copy2(legacy_calibration, CALIBRATION_FILE)
+        except OSError:
+            pass
 
 # ---------------------------
 # Logging setup
@@ -644,37 +713,123 @@ class Settings:
     frequency: float = 141.575
     gain: int = 5
     collection_time: int = 2
+    sample_window_s: float = 0.25
     antenna_count: int = 2
     antenna_spacing_in: float = 0.0  # 0 = auto (half-wavelength)
     info_refresh_s: int = 3
     movement_threshold_m: float = 5.0
+    adaptive_movement_pause: bool = True
+    movement_accuracy_factor: float = 2.0
+    gps_accuracy_floor_m: float = 3.0
+    alert_debounce_cycles: int = 2
     calibration_profile: str = "default"
     fusion_aoa_weight: float = 0.7
     fusion_map_weight: float = 0.3
     confidence_threshold: float = 0.4
     auto_tune_fusion: bool = True
+    antenna_orientations_deg: list[float] = field(default_factory=list)
+    preferred_gps_port: Optional[str] = None
 
     def to_dict(self):
         return {
             "frequency": self.frequency,
             "gain": self.gain,
             "collection_time": self.collection_time,
+            "sample_window_s": self.sample_window_s,
             "antenna_count": self.antenna_count,
             "antenna_spacing_in": self.antenna_spacing_in,
             "info_refresh_s": self.info_refresh_s,
             "movement_threshold_m": self.movement_threshold_m,
+            "adaptive_movement_pause": self.adaptive_movement_pause,
+            "movement_accuracy_factor": self.movement_accuracy_factor,
+            "gps_accuracy_floor_m": self.gps_accuracy_floor_m,
+            "alert_debounce_cycles": self.alert_debounce_cycles,
             "calibration_profile": self.calibration_profile,
             "fusion_aoa_weight": self.fusion_aoa_weight,
             "fusion_map_weight": self.fusion_map_weight,
             "confidence_threshold": self.confidence_threshold,
             "auto_tune_fusion": self.auto_tune_fusion,
+            "antenna_orientations_deg": list(self.antenna_orientations_deg),
+            "preferred_gps_port": self.preferred_gps_port,
         }
 
-# Global shared settings with a lock for thread-safety
-settings = Settings()
 settings_lock = threading.Lock()
+
+
+def _load_settings() -> Settings:
+    if not os.path.exists(SETTINGS_FILE):
+        return Settings()
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return Settings()
+        allowed = {item.name for item in fields(Settings)}
+        return Settings(**{key: value for key, value in raw.items() if key in allowed})
+    except Exception:
+        logging.getLogger().warning("Failed to load persisted settings.", exc_info=True)
+        return Settings()
+
+
+settings = _load_settings()
+
+
+def save_settings() -> None:
+    with settings_lock:
+        snapshot = settings.to_dict()
+    temp_path = SETTINGS_FILE + ".tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2)
+        os.replace(temp_path, SETTINGS_FILE)
+    except Exception:
+        logging.getLogger().warning("Failed to persist settings.", exc_info=True)
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+
+
 calibration_lock = threading.Lock()
 calibration_data = {}
+
+
+class AlertManager:
+    """Tracks debounced system alerts by stable key."""
+
+    def __init__(self):
+        self._states = {}
+
+    def update(self, key, active, message, severity="warning", debounce_cycles=1):
+        state = self._states.setdefault(
+            key,
+            {"count": 0, "visible": False, "active": False},
+        )
+        state.update({"message": str(message), "severity": str(severity)})
+        state["active"] = bool(active)
+        if active:
+            state["count"] += 1
+            if state["count"] >= max(1, int(debounce_cycles)):
+                state["visible"] = True
+        else:
+            state["count"] = 0
+            state["visible"] = False
+
+    def snapshot(self):
+        priority = {"error": 0, "warning": 1, "info": 2, "debug": 3}
+        items = []
+        for key, state in self._states.items():
+            if not state.get("visible"):
+                continue
+            items.append(
+                {
+                    "key": key,
+                    "message": state.get("message"),
+                    "severity": state.get("severity", "warning"),
+                }
+            )
+        return sorted(items, key=lambda item: (priority.get(item["severity"], 9), item["key"]))
 
 # ---------------------------
 # Helpers
@@ -748,6 +903,14 @@ def _distance_m(lat1, lon1, lat2, lon2) -> Optional[float]:
         return 6_371_000.0 * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _effective_movement_threshold_m(settings_snapshot: dict, gps_accuracy_m: Optional[float]) -> float:
+    configured = max(0.0, float(settings_snapshot.get("movement_threshold_m", 0.0) or 0.0))
+    if settings_snapshot.get("adaptive_movement_pause", True) and gps_accuracy_m is not None:
+        factor = max(0.0, float(settings_snapshot.get("movement_accuracy_factor", 2.0) or 0.0))
+        return max(configured, float(gps_accuracy_m) * factor)
+    return configured
 
 
 def _bearing_to_cardinal(deg: Optional[float]) -> str:
@@ -903,6 +1066,66 @@ def _fuse_bearings(bearings_with_weight: list[tuple[Optional[float], float]]) ->
 
 def _device_key(index: int, serial: Optional[str]) -> str:
     return f"serial:{serial}" if serial else f"index:{index}"
+
+
+def _acquire_sdr_samples(
+    states: list[tuple[int, dict]],
+    sample_window_s: float,
+    frequency_mhz: float,
+    gain: int,
+) -> dict[int, dict]:
+    """Read independent SDRs in parallel and return bounded capture results."""
+    if not states:
+        return {}
+
+    def _read(item):
+        idx, state = item
+        started = time.monotonic()
+        configuration = (float(frequency_mhz), int(gain), SDR_DEFAULT_SAMPLE_RATE)
+        try:
+            try:
+                samples = funcs.readRadio(
+                    state["radio"],
+                    sample_window_s,
+                    frequency_mhz,
+                    gain,
+                    configure=state.get("configuration") != configuration,
+                    max_samples=SDR_MAX_SAMPLES,
+                )
+            except TypeError as exc:
+                if "max_samples" not in str(exc):
+                    raise
+                samples = funcs.readRadio(
+                    state["radio"],
+                    sample_window_s,
+                    frequency_mhz,
+                    gain,
+                    configure=state.get("configuration") != configuration,
+                )
+            return idx, {
+                "samples": samples,
+                "configuration": configuration,
+                "latency_ms": (time.monotonic() - started) * 1000.0,
+                "error": None,
+            }
+        except Exception as exc:
+            return idx, {
+                "samples": None,
+                "configuration": configuration,
+                "latency_ms": (time.monotonic() - started) * 1000.0,
+                "error": exc,
+            }
+
+    output = {}
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(len(states), MAX_PARALLEL_SDR_READERS),
+        thread_name_prefix="PinpointSDR",
+    ) as executor:
+        futures = [executor.submit(_read, item) for item in states]
+        for future in concurrent.futures.as_completed(futures):
+            idx, result = future.result()
+            output[idx] = result
+    return output
 
 
 def _load_calibration_profiles() -> dict:
@@ -1120,11 +1343,10 @@ class DemoCollectorThread(QtCore.QThread):
                 if target_loc:
                     map_target_bearing = _bearing_deg(lat, lon, target_loc[0], target_loc[1])
 
-                with settings_lock:
-                    aoa_w = float(settings.fusion_aoa_weight)
-                    map_w = float(settings.fusion_map_weight)
-                    conf_threshold = float(settings.confidence_threshold)
-                    auto_tune = bool(getattr(settings, "auto_tune_fusion", False))
+                aoa_w = float(s.get("fusion_aoa_weight", 0.7))
+                map_w = float(s.get("fusion_map_weight", 0.3))
+                conf_threshold = float(s.get("confidence_threshold", 0.4))
+                auto_tune = bool(s.get("auto_tune_fusion", False))
                 if auto_tune:
                     aoa_factor = 0.5 + 0.5 * (aoa_confidence or 0.0)
                     map_factor = 0.5 + 0.5 * (map_confidence or 0.0)
@@ -1193,6 +1415,20 @@ class DemoCollectorThread(QtCore.QThread):
                         "map_confidence": map_confidence,
                         "fusion_confidence": fusion_confidence,
                         "bearing_source": bearing_source,
+                        "calculation_parameters": {
+                            "configured_settings": dict(s),
+                            "effective": {
+                                "frequency_mhz": freq_mhz,
+                                "sdr_sample_rate_hz": 2.048e6,
+                                "antenna_count": antenna_count,
+                                "antenna_orientations_deg": list(angles),
+                                "antenna_spacing_in": spacing_in,
+                                "fusion_aoa_weight": aoa_w,
+                                "fusion_map_weight": map_w,
+                                "confidence_threshold": conf_threshold,
+                                "bearing_method": "amplitude-derived",
+                            },
+                        },
                     }
                 )
                 self.status.emit("Demo Collecting")
@@ -1328,6 +1564,15 @@ class GPSLocationThread(QtCore.QThread):
                 if last_fix_time is not None:
                     fix_age = max(0.0, time.time() - last_fix_time)
                 has_fix = _gps_fix_is_current(last_fix, last_fix_time)
+                gps_metadata = funcs.get_gps_metadata(gps_reader)
+                gps_hdop = gps_metadata.get("hdop")
+                with settings_lock:
+                    accuracy_floor_m = settings.gps_accuracy_floor_m
+                gps_accuracy_m = (
+                    max(float(accuracy_floor_m), float(gps_hdop) * 5.0)
+                    if gps_hdop is not None
+                    else None
+                )
                 self.telemetry.emit(
                     {
                         "gps_fix": has_fix,
@@ -1335,6 +1580,11 @@ class GPSLocationThread(QtCore.QThread):
                         "sats": num_sats,
                         "fix_age_s": fix_age,
                         "satellites": satellites,
+                        "gps_hdop": gps_hdop,
+                        "gps_accuracy_m": gps_accuracy_m,
+                        "gps_altitude_m": gps_metadata.get("altitude_m"),
+                        "gps_speed_knots": gps_metadata.get("speed_knots"),
+                        "gps_course_deg": gps_metadata.get("course_deg"),
                         "location_only": True,
                     }
                 )
@@ -1429,6 +1679,7 @@ class CollectorThread(QtCore.QThread):
             last_sdr_scan = time.time()
             while not self.stop_event.is_set():
                 try:
+                    cycle_started_monotonic = time.monotonic()
                     changed_gps_port = self._consume_gps_port_change()
                     if changed_gps_port is not None:
                         if gps_serial is not None:
@@ -1476,7 +1727,8 @@ class CollectorThread(QtCore.QThread):
                         last_sdr_scan = now_scan
 
                     # Ensure SDR connections
-                    for idx in sorted(sdr_state.keys()):
+                    active_sdr_indices = sorted(sdr_state.keys())[: max(1, int(antenna_count))]
+                    for idx in active_sdr_indices:
                         state = sdr_state[idx]
                         if state["radio"] is None or not state["connected"]:
                             try:
@@ -1484,13 +1736,14 @@ class CollectorThread(QtCore.QThread):
                                 state["connected"] = True
                                 state["error"] = None
                                 state["configuration"] = None
+                                state["reconnect_count"] = state.get("reconnect_count", 0) + 1
                                 self.logger.info("SDR index %s connected", idx)
                             except Exception as e:
                                 state["connected"] = False
                                 state["error"] = str(e)
                                 state["radio"] = None
 
-                    sdr_connected = any(state.get("connected") for state in sdr_state.values())
+                    sdr_connected = any(sdr_state[idx].get("connected") for idx in active_sdr_indices)
 
                     gps_data = None
                     if gps_serial is None or gps_reader is None:
@@ -1512,7 +1765,7 @@ class CollectorThread(QtCore.QThread):
                                 serial_port=gps_serial,
                                 nmea_reader=gps_reader,
                                 stop_event=self._gps_read_stop_event,
-                                max_wait_s=GPS_MAX_WAIT_S,
+                                max_wait_s=COLLECTOR_GPS_MAX_WAIT_S,
                             )
                             if self._gps_port_change_event.is_set():
                                 continue
@@ -1529,6 +1782,14 @@ class CollectorThread(QtCore.QThread):
                             gps_next_retry = time.time() + backoff
                             self.status.emit("GPS error; reconnecting")
                             gps_data = None
+                    gps_metadata = funcs.get_gps_metadata(gps_reader) if gps_reader is not None else {}
+                    gps_hdop = gps_metadata.get("hdop")
+                    gps_accuracy_m = None
+                    if gps_hdop is not None:
+                        gps_accuracy_m = max(
+                            float(s.get("gps_accuracy_floor_m", 3.0) or 0.0),
+                            float(gps_hdop) * 5.0,
+                        )
                     has_fresh_fix = False
                     if gps_data is None:
                         # Timeout or stop; fall back to last fix if we have one
@@ -1585,7 +1846,27 @@ class CollectorThread(QtCore.QThread):
                     snrs = []
                     with calibration_lock:
                         cal_data = dict(calibration_data)
-                    for idx in sorted(sdr_state.keys()):
+                    selected_indices = sorted(sdr_state.keys())[: max(1, int(antenna_count))]
+                    capture_inputs = [
+                        (idx, sdr_state[idx])
+                        for idx in selected_indices
+                        if sdr_state[idx].get("connected") and sdr_state[idx].get("radio") is not None
+                    ]
+                    acquisition_started = time.time()
+                    capture_results = _acquire_sdr_samples(
+                        capture_inputs,
+                        max(0.01, min(2.0, float(s.get("sample_window_s", 0.25) or 0.25))),
+                        s["frequency"],
+                        s["gain"],
+                    )
+                    acquisition_finished = time.time()
+                    measurement_ts = (acquisition_started + acquisition_finished) / 2.0
+                    gps_measurement_offset_ms = (
+                        (measurement_ts - last_fix_time) * 1000.0
+                        if last_fix_time is not None
+                        else None
+                    )
+                    for idx in selected_indices:
                         state = sdr_state[idx]
                         if not state.get("connected") or state.get("radio") is None:
                             antenna_states.append(
@@ -1599,18 +1880,22 @@ class CollectorThread(QtCore.QThread):
                                     "strength": None,
                                     "snr": None,
                                     "quality": None,
+                                    "health": "Unhealthy",
+                                    "health_reason": state.get("error") or "Disconnected",
+                                    "read_latency_ms": state.get("read_latency_ms"),
+                                    "sample_count": 0,
+                                    "last_success_ts": state.get("last_success_ts"),
+                                    "consecutive_failures": state.get("consecutive_failures", 0),
+                                    "reconnect_count": state.get("reconnect_count", 0),
+                                    "spectrum_db": [],
                                 }
                             )
                             continue
                         try:
-                            configuration = (float(s["frequency"]), int(s["gain"]), SDR_DEFAULT_SAMPLE_RATE)
-                            samples = funcs.readRadio(
-                                state["radio"],
-                                s["collection_time"],
-                                s["frequency"],
-                                s["gain"],
-                                configure=state.get("configuration") != configuration,
-                            )
+                            capture = capture_results.get(idx) or {}
+                            if capture.get("error") is not None:
+                                raise capture["error"]
+                            samples = capture.get("samples")
                             if samples is None or len(samples) == 0:
                                 raise Exception("No SDR samples")
                             processed = funcs.processSamples(samples)
@@ -1629,8 +1914,22 @@ class CollectorThread(QtCore.QThread):
                             state["strength"] = strength
                             state["snr"] = quality.get("snr", 0.0)
                             state["quality"] = quality.get("quality", 0.0)
+                            state["power_dbfs"] = quality.get("power_dbfs")
+                            state["spectrum_db"] = funcs.calculateSpectrum(samples)
                             state["sample_rate"] = getattr(state["radio"], "sample_rate", None)
-                            state["configuration"] = configuration
+                            state["configuration"] = capture.get("configuration")
+                            state["read_latency_ms"] = capture.get("latency_ms")
+                            state["sample_count"] = len(samples)
+                            state["last_success_ts"] = time.time()
+                            state["consecutive_failures"] = 0
+                            latency_limit = max(1000.0, float(s.get("sample_window_s", 0.25)) * 3000.0)
+                            healthy = state["read_latency_ms"] <= latency_limit and state["quality"] >= 0.15
+                            state["health"] = "Healthy" if healthy else "Degraded"
+                            state["health_reason"] = (
+                                "Capture and signal metrics normal"
+                                if healthy
+                                else "Slow capture or low signal quality"
+                            )
 
                             strengths.append(strength)
                             qualities.append(state["quality"])
@@ -1647,11 +1946,23 @@ class CollectorThread(QtCore.QThread):
                                     "strength": strength,
                                     "snr": state["snr"],
                                     "quality": state["quality"],
+                                    "power_dbfs": state.get("power_dbfs"),
+                                    "health": state.get("health"),
+                                    "health_reason": state.get("health_reason"),
+                                    "read_latency_ms": state.get("read_latency_ms"),
+                                    "sample_count": state.get("sample_count"),
+                                    "last_success_ts": state.get("last_success_ts"),
+                                    "consecutive_failures": state.get("consecutive_failures", 0),
+                                    "reconnect_count": state.get("reconnect_count", 0),
+                                    "spectrum_db": state.get("spectrum_db", []),
                                 }
                             )
                         except Exception as e:
                             state["connected"] = False
                             state["error"] = str(e)
+                            state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
+                            state["health"] = "Unhealthy"
+                            state["health_reason"] = str(e)
                             self.logger.warning("SDR index %s error: %s", idx, e)
                             try:
                                 if state.get("radio") is not None:
@@ -1670,6 +1981,14 @@ class CollectorThread(QtCore.QThread):
                                     "strength": None,
                                     "snr": None,
                                     "quality": None,
+                                    "health": "Unhealthy",
+                                    "health_reason": str(e),
+                                    "read_latency_ms": state.get("read_latency_ms"),
+                                    "sample_count": 0,
+                                    "last_success_ts": state.get("last_success_ts"),
+                                    "consecutive_failures": state.get("consecutive_failures", 0),
+                                    "reconnect_count": state.get("reconnect_count", 0),
+                                    "spectrum_db": [],
                                 }
                             )
 
@@ -1695,7 +2014,11 @@ class CollectorThread(QtCore.QThread):
                     self.logger.info(f"Estimated signal strength: {strength} / 1000")
                     self.logger.debug("Signal quality: %s", quality)
 
-                    movement_threshold_m = max(0.0, float(s.get("movement_threshold_m", 0.0) or 0.0))
+                    configured_movement_threshold_m = max(
+                        0.0,
+                        float(s.get("movement_threshold_m", 0.0) or 0.0),
+                    )
+                    movement_threshold_m = _effective_movement_threshold_m(s, gps_accuracy_m)
                     movement_distance_m = None
                     cycle_paused = False
                     pause_reason = None
@@ -1759,7 +2082,16 @@ class CollectorThread(QtCore.QThread):
                     map_confidence = 0.0
                     fusion_confidence = 0.0
                     bearing_source = None
-                    target_loc = _estimate_target_from_history(history)
+                    target_estimate = None
+                    try:
+                        target_estimate = funcs.estimateTransmitterLocation(history, self.logger) if history else None
+                    except ValueError:
+                        target_estimate = None
+                    target_loc = (
+                        (target_estimate["lat"], target_estimate["lon"])
+                        if target_estimate
+                        else _estimate_target_from_history(history)
+                    )
                     if present_gps_loc and target_loc:
                         map_target_bearing = _bearing_deg(
                             present_gps_loc[0], present_gps_loc[1], target_loc[0], target_loc[1]
@@ -1768,7 +2100,11 @@ class CollectorThread(QtCore.QThread):
                     aoa_relative = None
                     aoa_bearing = None
                     if antenna_states:
-                        angles = _antenna_angles(len(antenna_states))
+                        configured_angles = s.get("antenna_orientations_deg") or []
+                        if len(configured_angles) >= len(antenna_states):
+                            angles = [float(v) % 360.0 for v in configured_angles[: len(antenna_states)]]
+                        else:
+                            angles = _antenna_angles(len(antenna_states))
                         aoa_relative, aoa_confidence = _aoa_from_strengths(
                             [a.get("strength") if a.get("connected") else None for a in antenna_states],
                             angles,
@@ -1779,11 +2115,10 @@ class CollectorThread(QtCore.QThread):
 
                     map_confidence = _map_confidence(history)
 
-                    with settings_lock:
-                        aoa_w = float(settings.fusion_aoa_weight)
-                        map_w = float(settings.fusion_map_weight)
-                        conf_threshold = float(settings.confidence_threshold)
-                        auto_tune = bool(getattr(settings, "auto_tune_fusion", False))
+                    aoa_w = float(s.get("fusion_aoa_weight", 0.7))
+                    map_w = float(s.get("fusion_map_weight", 0.3))
+                    conf_threshold = float(s.get("confidence_threshold", 0.4))
+                    auto_tune = bool(s.get("auto_tune_fusion", False))
                     if auto_tune:
                         aoa_factor = 0.5 + 0.5 * (aoa_confidence or 0.0)
                         map_factor = 0.5 + 0.5 * (map_confidence or 0.0)
@@ -1839,6 +2174,11 @@ class CollectorThread(QtCore.QThread):
                             "gps_loc": present_gps_loc,
                             "sats": num_sats,
                             "fix_age_s": fix_age,
+                            "gps_hdop": gps_hdop,
+                            "gps_accuracy_m": gps_accuracy_m,
+                            "gps_altitude_m": gps_metadata.get("altitude_m"),
+                            "gps_speed_knots": gps_metadata.get("speed_knots"),
+                            "gps_course_deg": gps_metadata.get("course_deg"),
                             "strength": strength,
                             "snr": quality.get("snr", None),
                             "quality": quality.get("quality", None),
@@ -1862,13 +2202,40 @@ class CollectorThread(QtCore.QThread):
                             "pause_reason": pause_reason,
                             "movement_distance_m": movement_distance_m,
                             "movement_threshold_m": movement_threshold_m,
+                            "configured_movement_threshold_m": configured_movement_threshold_m,
+                            "adaptive_movement_pause": bool(s.get("adaptive_movement_pause", True)),
                             "map_cycle_accepted": map_cycle_accepted,
+                            "acquisition_started_ts": acquisition_started,
+                            "acquisition_finished_ts": acquisition_finished,
+                            "acquisition_duration_ms": (acquisition_finished - acquisition_started) * 1000.0,
+                            "measurement_ts": measurement_ts,
+                            "gps_fix_ts": last_fix_time,
+                            "gps_measurement_offset_ms": gps_measurement_offset_ms,
+                            "bearing_method": "amplitude-derived",
+                            "target_estimate": target_estimate,
+                            "calculation_parameters": {
+                                "configured_settings": dict(s),
+                                "effective": {
+                                    "frequency_mhz": freq_mhz,
+                                    "sdr_sample_rate_hz": sdr_sample_rate,
+                                    "antenna_count": actual_antenna_count,
+                                    "antenna_orientations_deg": list(angles) if antenna_states else [],
+                                    "antenna_spacing_in": spacing_in,
+                                    "fusion_aoa_weight": aoa_w,
+                                    "fusion_map_weight": map_w,
+                                    "confidence_threshold": conf_threshold,
+                                    "movement_threshold_m": movement_threshold_m,
+                                    "bearing_method": "amplitude-derived",
+                                },
+                            },
                         }
                     )
                     self.status.emit("Collecting")
                     consecutive_failures = 0
-                    # Light pacing to reduce thrash; respects collection_time already
-                    time.sleep(0.1)
+                    cycle_elapsed = time.monotonic() - cycle_started_monotonic
+                    cycle_remaining = max(0.0, float(s.get("collection_time", 1.0)) - cycle_elapsed)
+                    if cycle_remaining > 0:
+                        self.stop_event.wait(cycle_remaining)
 
                 except Exception as e:  # Never crash the thread
                     # Log full traceback for diagnostics and emit a short message to the UI

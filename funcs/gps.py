@@ -160,12 +160,30 @@ def list_serial_ports():
 def _gps_reader_state(nmea_reader):
     state = getattr(nmea_reader, "_pinpoint_state", None)
     if not isinstance(state, dict):
-        state = {"satellites_by_talker": {}, "last_num_sats": None}
+        state = {
+            "satellites_by_talker": {},
+            "last_num_sats": None,
+            "hdop": None,
+            "altitude_m": None,
+            "speed_knots": None,
+            "course_deg": None,
+        }
         try:
             setattr(nmea_reader, "_pinpoint_state", state)
         except Exception:
             pass
     return state
+
+
+def get_gps_metadata(nmea_reader):
+    """Return the most recently observed GPS quality/motion metadata."""
+    state = _gps_reader_state(nmea_reader)
+    return {
+        "hdop": state.get("hdop"),
+        "altitude_m": state.get("altitude_m"),
+        "speed_knots": state.get("speed_knots"),
+        "course_deg": state.get("course_deg"),
+    }
 
 
 def _cached_satellites(reader_state):
@@ -224,6 +242,8 @@ def readGPS(logger, serial_port=None, nmea_reader=None, stop_event=None, max_wai
                     logger.info(f"Number of satellites: {msg.num_sats}")
                     last_num_sats = msg.num_sats
                     reader_state["last_num_sats"] = last_num_sats
+                    reader_state["hdop"] = _safe_float(getattr(msg, "horizontal_dil", None))
+                    reader_state["altitude_m"] = _safe_float(getattr(msg, "altitude", None))
                     if msg.latitude != 0.0 and msg.longitude != 0.0:
                         latitude = msg.latitude
                         longitude = msg.longitude
@@ -233,6 +253,8 @@ def readGPS(logger, serial_port=None, nmea_reader=None, stop_event=None, max_wai
                         logger.debug("Waiting for valid coordinates...")
                 elif msg.sentence_type == 'RMC':
                     position_data_seen = True
+                    reader_state["speed_knots"] = _safe_float(getattr(msg, "spd_over_grnd", None))
+                    reader_state["course_deg"] = _safe_float(getattr(msg, "true_course", None))
                     if (
                         getattr(msg, "status", "A") == "A"
                         and msg.latitude != 0.0

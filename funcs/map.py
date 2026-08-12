@@ -12,6 +12,8 @@ https://nexus.crayton.dev/
 """
 
 import logging
+import math
+import json
 from io import BytesIO
 from urllib.parse import quote
 
@@ -77,9 +79,47 @@ def predictTransmitterLocation(history, logger):
     weighted_lat = sum(lat * strength * quality for lat, _, strength, quality in filtered_points) / total_weight
     weighted_lon = sum(lon * strength * quality for _, lon, strength, quality in filtered_points) / total_weight
 
-    logger.warning("Estimated transmitter location: %.6f, %.6f", weighted_lat, weighted_lon)
+    logger.debug("Estimated transmitter location: %.6f, %.6f", weighted_lat, weighted_lon)
 
     return weighted_lat, weighted_lon
+
+
+def estimateTransmitterLocation(history, logger):
+    """Return a transmitter estimate with a conservative confidence radius."""
+    lat, lon = predictTransmitterLocation(history, logger)
+    weighted_distances = []
+    total_weight = 0.0
+    for (point_lat, point_lon), value in history.items():
+        strength = value.get("strength", 0) if isinstance(value, dict) else value
+        quality = value.get("quality", 1.0) if isinstance(value, dict) else 1.0
+        if strength is None or float(strength) <= 200:
+            continue
+        phi1 = math.radians(lat)
+        phi2 = math.radians(float(point_lat))
+        dphi = phi2 - phi1
+        dlon = math.radians(float(point_lon) - lon)
+        a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlon / 2.0) ** 2
+        distance_m = 6_371_000.0 * 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
+        weight = max(0.0, float(strength) * max(0.0, float(quality or 0.0)))
+        weighted_distances.append((distance_m, weight))
+        total_weight += weight
+    count = len(weighted_distances)
+    if not count or total_weight <= 0:
+        radius_m = 250.0
+    else:
+        radius_m = math.sqrt(sum((distance ** 2) * weight for distance, weight in weighted_distances) / total_weight)
+        radius_m = max(10.0, radius_m)
+        if count < 3:
+            radius_m = max(radius_m, 100.0)
+    confidence = min(1.0, count / 8.0) * (1.0 / (1.0 + radius_m / 250.0))
+    return {
+        "lat": float(lat),
+        "lon": float(lon),
+        "radius_m": float(radius_m),
+        "confidence": float(max(0.0, min(1.0, confidence))),
+        "point_count": count,
+        "method": "signal-weighted centroid",
+    }
 
 def _render_offline_map(history, output_file="map.png", size=(800, 500)):
     if not history:
@@ -96,13 +136,15 @@ def _render_offline_map(history, output_file="map.png", size=(800, 500)):
 
     min_lat, max_lat = min(lats), max(lats)
     min_lon, max_lon = min(lons), max(lons)
-    lat_span = max(1e-6, max_lat - min_lat)
-    lon_span = max(1e-6, max_lon - min_lon)
-    # Add some padding
-    min_lat -= lat_span * 0.08
-    max_lat += lat_span * 0.08
-    min_lon -= lon_span * 0.08
-    max_lon += lon_span * 0.08
+    raw_lat_span = max_lat - min_lat
+    raw_lon_span = max_lon - min_lon
+    # Add padding while keeping a single-coordinate map centered.
+    lat_padding = raw_lat_span * 0.08 if raw_lat_span > 0.0 else 0.5e-6
+    lon_padding = raw_lon_span * 0.08 if raw_lon_span > 0.0 else 0.5e-6
+    min_lat -= lat_padding
+    max_lat += lat_padding
+    min_lon -= lon_padding
+    max_lon += lon_padding
     lat_span = max(1e-6, max_lat - min_lat)
     lon_span = max(1e-6, max_lon - min_lon)
 
@@ -160,8 +202,14 @@ def _render_offline_map(history, output_file="map.png", size=(800, 500)):
 
     # Predicted location marker
     try:
-        pred_lat, pred_lon = predictTransmitterLocation(history, logging.getLogger("offline-map"))
+        estimate = estimateTransmitterLocation(history, logging.getLogger("offline-map"))
+        pred_lat, pred_lon = estimate["lat"], estimate["lon"]
         px, py = _xy(pred_lat, pred_lon)
+        radius_lat = estimate["radius_m"] / 111_320.0
+        radius_lon = estimate["radius_m"] / max(1.0, 111_320.0 * math.cos(math.radians(pred_lat)))
+        rx = min(width, abs(_xy(pred_lat, pred_lon + radius_lon)[0] - px))
+        ry = min(height, abs(_xy(pred_lat + radius_lat, pred_lon)[1] - py))
+        draw.ellipse((px - rx, py - ry, px + rx, py + ry), outline="#10b981", width=2)
         draw.ellipse((px - 6, py - 6, px + 6, py + 6), fill="#10b981", outline="#065f46")
     except Exception:
         pass
@@ -250,10 +298,27 @@ def mapFunction(history, access_token, logger, output_file="map.png", max_marker
 
     # Predict transmitter location and add a green marker
     pred_marker = None
+    confidence_feature = None
     try:
-        predicted_location = predictTransmitterLocation(history, logger)
-        pred_lat, pred_lon = predicted_location
+        estimate = estimateTransmitterLocation(history, logger)
+        pred_lat, pred_lon = estimate["lat"], estimate["lon"]
         pred_marker = f"pin-l+00ff00({pred_lon},{pred_lat})"  # Hex for green
+        radius = estimate["radius_m"]
+        lat_rad = math.radians(pred_lat)
+        coordinates = []
+        for i in range(25):
+            angle = (i / 24.0) * math.pi * 2.0
+            d_lat = (radius * math.sin(angle)) / 111_320.0
+            d_lon = (radius * math.cos(angle)) / max(1.0, 111_320.0 * math.cos(lat_rad))
+            coordinates.append([pred_lon + d_lon, pred_lat + d_lat])
+        confidence_feature = "geojson(" + json.dumps(
+            {
+                "type": "Feature",
+                "properties": {"stroke": "#10b981", "stroke-width": 2, "fill": "#10b981", "fill-opacity": 0.16},
+                "geometry": {"type": "Polygon", "coordinates": [coordinates]},
+            },
+            separators=(",", ":"),
+        ) + ")"
     except ValueError as e:
         logger.warning(f"Cannot predict transmitter location: {e}")
 
@@ -262,6 +327,8 @@ def mapFunction(history, access_token, logger, output_file="map.png", max_marker
         all_features = list(point_markers)
         if pred_marker:
             all_features.append(pred_marker)
+        if confidence_feature:
+            all_features.append(confidence_feature)
         features_str = ",".join(quote(f) for f in all_features)
         return features_str, f"{base_url}/{features_str}/auto/800x500?access_token={access_token}"
 
@@ -281,10 +348,17 @@ def mapFunction(history, access_token, logger, output_file="map.png", max_marker
 
     features_str, url = _make_url(features)
     if max_url_len and pred_marker and len(url) > max_url_len:
+        confidence_feature = None
+        features_str, url = _make_url(features)
+    if max_url_len and pred_marker and len(url) > max_url_len:
         pred_marker = None
         features_str, url = _make_url(features)
 
-    logger.debug("Map request URL: %s", url)
+    logger.debug(
+        "Requesting Mapbox static map (markers=%d, url_length=%d)",
+        len(features) + (1 if pred_marker else 0),
+        len(url),
+    )
 
     # Request the map image
     try:

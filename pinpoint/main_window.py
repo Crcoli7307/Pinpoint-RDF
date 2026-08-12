@@ -22,6 +22,21 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     QtWebEngineWidgets = None
 
+try:
+    from PyQt6 import QtWebChannel  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    QtWebChannel = None
+
+
+class _MapPointBridge(QtCore.QObject):
+    """Small WebChannel bridge used by map markers to select a telemetry cycle."""
+
+    point_selected = QtCore.pyqtSignal(str)
+
+    @QtCore.pyqtSlot(str)
+    def selectPoint(self, point_id: str) -> None:  # noqa: N802 - JavaScript-facing API
+        self.point_selected.emit(str(point_id))
+
 # ---------------------------
 # Main Window
 # ---------------------------
@@ -32,8 +47,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.playback_only = playback_only
         self.meshtastic_only = meshtastic_only
         self.setWindowTitle(APP_TITLE)
-        self.setMinimumSize(1000, 900)
-        self.resize(1100, 950)
+        self.setMinimumSize(1200, 900)
+        self.resize(1450, 950)
         self.setStyleSheet(self._style())
         _apply_app_icon(self)
         self._psutil_proc = psutil.Process(os.getpid()) if psutil else None
@@ -53,6 +68,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.image_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.image_label.setContentsMargins(12, 12, 12, 12)
         self.image_label.setMinimumSize(820, 620)
+        self.image_label.installEventFilter(self)
 
         self.map_view = None
         if QtWebEngineWidgets is not None:
@@ -70,6 +86,76 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.map_view is not None:
             self.map_stack.addWidget(self.map_view)
         self.map_stack.setCurrentWidget(self.image_label)
+
+        self._map_point_details: dict[str, dict] = {}
+        self._selected_map_point_id: Optional[str] = None
+        self._map_point_bridge = _MapPointBridge(self)
+        self._map_point_bridge.point_selected.connect(self._select_map_point)
+        self._map_web_channel = None
+        if self.map_view is not None and QtWebChannel is not None:
+            try:
+                self._map_web_channel = QtWebChannel.QWebChannel(self.map_view.page())
+                self._map_web_channel.registerObject("pointBridge", self._map_point_bridge)
+                self.map_view.page().setWebChannel(self._map_web_channel)
+            except Exception:
+                logger.warning("Interactive map point selection bridge could not be initialized.", exc_info=True)
+                self._map_web_channel = None
+
+        # This inspector intentionally starts completely blank. Selecting a map fix
+        # reveals the full telemetry snapshot for that one collection cycle.
+        self.point_inspector = QtWidgets.QFrame()
+        self.point_inspector.setObjectName("pointInspector")
+        self.point_inspector.setMinimumWidth(320)
+        self.point_inspector.setMaximumWidth(430)
+        self.point_inspector_stack = QtWidgets.QStackedLayout(self.point_inspector)
+        self.point_inspector_stack.setContentsMargins(0, 0, 0, 0)
+        self.point_inspector_blank = QtWidgets.QWidget()
+        self.point_inspector_content = QtWidgets.QWidget()
+        inspector_layout = QtWidgets.QVBoxLayout(self.point_inspector_content)
+        inspector_layout.setContentsMargins(12, 12, 12, 12)
+        self.point_inspector_title = QtWidgets.QLabel("Selected Fix")
+        self.point_inspector_title.setObjectName("pointInspectorTitle")
+        self.point_inspector_close_btn = QtWidgets.QToolButton()
+        self.point_inspector_close_btn.setObjectName("pointInspectorClose")
+        self.point_inspector_close_btn.setText("×")
+        self.point_inspector_close_btn.setToolTip("Clear selected fix")
+        self.point_inspector_close_btn.setAccessibleName("Clear selected fix")
+        self.point_inspector_close_btn.setFixedSize(28, 28)
+        self.point_inspector_close_btn.clicked.connect(self._clear_point_inspector)
+        inspector_header = QtWidgets.QHBoxLayout()
+        inspector_header.setContentsMargins(0, 0, 0, 0)
+        inspector_header.addWidget(self.point_inspector_title)
+        inspector_header.addStretch(1)
+        inspector_header.addWidget(self.point_inspector_close_btn)
+        self.point_inspector_summary = QtWidgets.QLabel()
+        self.point_inspector_summary.setObjectName("pointInspectorSummary")
+        self.point_inspector_summary.setWordWrap(True)
+        self.point_inspector_tree = QtWidgets.QTreeWidget()
+        self.point_inspector_tree.setObjectName("pointInspectorTree")
+        self.point_inspector_tree.setHeaderLabels(["Field", "Value"])
+        self.point_inspector_tree.setAlternatingRowColors(True)
+        self.point_inspector_tree.setUniformRowHeights(True)
+        self.point_inspector_tree.header().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.point_inspector_tree.header().setSectionResizeMode(
+            1, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+        inspector_layout.addLayout(inspector_header)
+        inspector_layout.addWidget(self.point_inspector_summary)
+        inspector_layout.addWidget(self.point_inspector_tree, stretch=1)
+        self.point_inspector_stack.addWidget(self.point_inspector_blank)
+        self.point_inspector_stack.addWidget(self.point_inspector_content)
+        self.point_inspector_stack.setCurrentWidget(self.point_inspector_blank)
+
+        self.map_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.map_splitter.setObjectName("mapColumns")
+        self.map_splitter.setChildrenCollapsible(False)
+        self.map_splitter.addWidget(self.point_inspector)
+        self.map_splitter.addWidget(self.map_container)
+        self.map_splitter.setStretchFactor(0, 0)
+        self.map_splitter.setStretchFactor(1, 1)
+        self.map_splitter.setSizes([350, 1000])
 
         self._interactive_map_enabled = False
         self._map_initialized = False
@@ -133,6 +219,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Activity", "activity"),
             ("GPS", "gps"),
             ("Coordinates", "coordinates"),
+            ("GPS Accuracy", "gps_accuracy"),
             ("Satellites", "sats"),
             ("Fix Age", "fix_age"),
             ("SDR", "sdr"),
@@ -204,7 +291,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Layout
         layout = QtWidgets.QVBoxLayout(central)
-        layout.addWidget(self.map_container, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.map_splitter, stretch=1)
         layout.addSpacing(8)
         layout.addSpacing(6)
         layout.addWidget(self.info_panel)
@@ -279,11 +366,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.latest_gps_loc = None
         self.latest_sats = None
         self.latest_fix_age = None
+        self.latest_gps_hdop = None
+        self.latest_gps_accuracy_m = None
         self.latest_strength = None
         self.latest_snr = None
         self.latest_quality = None
         self.latest_cycle_paused = False
         self.latest_pause_reason = None
+        self.latest_target_estimate = None
+        self.latest_telemetry = {}
+        self.alert_manager = AlertManager()
         try:
             self.sdr_connected = bool(funcs.list_sdr_devices())
         except Exception:
@@ -299,9 +391,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.map_confidence = 0.0
         self.fusion_confidence = 0.0
         self.bearing_source = None
-        # Clear app on startup to match original behavior
-        QtCore.QTimer.singleShot(50, self.clear_app)
-
         # Initialize info panel after state is ready
         self._update_info_panel()
         self._refresh_map_mode(force=True)
@@ -401,6 +490,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.api.register("data.get_report_data", lambda _p: {"data": self._get_report_data()})
         self.api.register("data.get_history_points", lambda _p: {"points": self._get_history_points()})
         self.api.register("data.report_available", lambda _p: {"available": self._report_available()})
+        self.api.register("data.get_latest_telemetry", lambda _p: {"telemetry": dict(self.latest_telemetry)})
+        self.api.register("alerts.get", lambda _p: {"alerts": self.alert_manager.snapshot()})
+        self.api.register("alerts.publish", self._api_publish_alert)
 
         self.api.register("log.debug", lambda p: self._api_log(logging.DEBUG, p))
         self.api.register("log.info", lambda p: self._api_log(logging.INFO, p))
@@ -417,6 +509,15 @@ class MainWindow(QtWidgets.QMainWindow):
         parts = payload.get("parts") or []
         if not isinstance(parts, (list, tuple)):
             parts = [parts]
+        if len(parts) == 1:
+            mutable_paths = {
+                "main.log": LOG_FILE,
+                "map.png": IMAGE_PATH,
+                "calibration_profiles.json": CALIBRATION_FILE,
+                "settings.json": SETTINGS_FILE,
+            }
+            if str(parts[0]) in mutable_paths:
+                return {"path": mutable_paths[str(parts[0])]}
         return {"path": _resource_path(*[str(p) for p in parts])}
 
     def _api_get_settings(self, _payload: dict) -> dict:
@@ -441,6 +542,21 @@ class MainWindow(QtWidgets.QMainWindow):
             return {"ok": False, "error": "Missing 'message'."}
         logger.log(level, str(msg))
         return {"ok": True}
+
+    def _api_publish_alert(self, payload: dict) -> dict:
+        key = str(payload.get("key") or "addon-alert")
+        severity = str(payload.get("severity") or "info").lower()
+        if severity not in ("error", "warning", "info", "debug"):
+            return {"ok": False, "error": "Severity must be error, warning, info, or debug."}
+        self.alert_manager.update(
+            key,
+            bool(payload.get("active", True)),
+            payload.get("message") or key.upper(),
+            severity,
+            max(1, int(payload.get("debounce_cycles", 1))),
+        )
+        self.update_image(force=True)
+        return {"alert": key}
 
     def _api_bus_emit(self, payload: dict) -> dict:
         event = payload.get("event")
@@ -587,6 +703,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         sats_text = "--" if self.latest_sats is None else str(self.latest_sats)
         fix_age_text = "--" if self.latest_fix_age is None else f"{self.latest_fix_age:.0f}s"
+        gps_accuracy_text = "--"
+        if self.latest_gps_accuracy_m is not None:
+            gps_accuracy_text = f"±{self.latest_gps_accuracy_m:.1f}m"
+            if self.latest_gps_hdop is not None:
+                gps_accuracy_text += f" (HDOP {self.latest_gps_hdop:.1f})"
         coordinates_text = "--"
         if self.latest_gps_loc is not None:
             try:
@@ -630,6 +751,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._info_values["activity"].setText(activity)
         self._info_values["gps"].setText(gps_text)
         self._info_values["coordinates"].setText(coordinates_text)
+        self._info_values["gps_accuracy"].setText(gps_accuracy_text)
         self._info_values["sats"].setText(sats_text)
         self._info_values["fix_age"].setText(fix_age_text)
         self._info_values["sdr"].setText(sdr_text)
@@ -695,6 +817,14 @@ class MainWindow(QtWidgets.QMainWindow):
             #infoSummary { font-weight: 600; color: #111827; padding-bottom: 4px; }
             #infoKey { color: #6b7280; }
             #infoValue { color: #111827; }
+            #pointInspector { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 10px; }
+            #pointInspectorTitle { font-size: 18px; font-weight: 700; color: #111827; }
+            #pointInspectorSummary { color: #4b5563; padding: 2px 0 8px 0; }
+            #pointInspectorTree { border: 1px solid #e5e7eb; border-radius: 7px; background: #ffffff; alternate-background-color: #f9fafb; }
+            #pointInspectorTree::item { padding: 3px 2px; }
+            #pointInspectorClose { border: 0; border-radius: 14px; background: transparent; color: #6b7280; font-size: 22px; font-weight: 600; padding: 0; }
+            #pointInspectorClose:hover { background: #e5e7eb; color: #111827; }
+            #mapColumns::handle { background: transparent; width: 8px; }
             #appTitle {
                 font-size: 22px; font-weight: 700; padding: 16px 0; color: #111827;
             }
@@ -735,10 +865,15 @@ class MainWindow(QtWidgets.QMainWindow):
         port = wizard.selected_port()
         if not port:
             return
+        remember_port = bool(getattr(wizard, "remember_port", lambda: False)())
 
         old_port = self.gps_port
         self.gps_port = port
         os.environ["GPS_PORT"] = port
+        if remember_port:
+            with settings_lock:
+                settings.preferred_gps_port = port
+            save_settings()
         if self._hardware_monitor_thread is not None:
             self._hardware_monitor_thread.gps_port = port
 
@@ -746,9 +881,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.latest_gps_loc = None
         self.latest_sats = None
         self.latest_fix_age = None
+        self.latest_gps_hdop = None
+        self.latest_gps_accuracy_m = None
         self.latest_satellites = []
         self.latest_cycle_paused = False
         self.latest_pause_reason = None
+        self.latest_target_estimate = None
         self._idle_gps_point = None
         self.current_bearing = None
         self.last_status_msg = f"Switching GPS to {port}"
@@ -759,7 +897,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stop_idle_gps_tracking()
             QtCore.QTimer.singleShot(0, self._start_idle_gps_tracking)
 
-        logger.info("GPS port changed from %s to %s.", old_port or "none", port)
+        logger.info(
+            "GPS port changed from %s to %s%s.",
+            old_port or "none",
+            port,
+            " and saved as the default" if remember_port else " for this run",
+        )
         self._update_info_panel()
         self._refresh_info_dialogs(force=True)
         self.update_image(force=True)
@@ -934,10 +1077,12 @@ class MainWindow(QtWidgets.QMainWindow):
             antenna_count = settings.antenna_count
             profile = settings.calibration_profile
             spacing_in = settings.antenna_spacing_in
+            antenna_orientations_deg = list(settings.antenna_orientations_deg)
         return {
             "frequency_mhz": freq,
             "antenna_count": antenna_count,
             "antenna_spacing_in": spacing_in,
+            "antenna_orientations_deg": antenna_orientations_deg,
             "ideal_spacing_in": _ideal_spacing_inches(freq),
             "strength": self.latest_strength,
             "snr": self.latest_snr,
@@ -961,6 +1106,8 @@ class MainWindow(QtWidgets.QMainWindow):
         header = {}
         frames = []
         flags = []
+        frame_stride = 1
+        seen_frames = 0
         total_bytes = 0
         try:
             total_bytes = os.path.getsize(path)
@@ -979,13 +1126,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
-                obj = json.loads(line)
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.warning("Skipping malformed recording line near byte %s.", f.tell())
+                    continue
+                if not isinstance(obj, dict):
+                    logger.warning("Skipping non-object recording entry near byte %s.", f.tell())
+                    continue
                 if obj.get("type") == "pinplyr":
                     header = obj
                 elif obj.get("type") == "flag":
                     flags.append(obj)
                 else:
-                    frames.append(obj)
+                    telemetry = obj.get("telemetry")
+                    if not isinstance(telemetry, dict):
+                        logger.warning("Skipping recording frame without telemetry near byte %s.", f.tell())
+                        continue
+                    seen_frames += 1
+                    if seen_frames % frame_stride == 0:
+                        frames.append(obj)
+                    if PLAYBACK_MAX_FRAMES > 0 and len(frames) > PLAYBACK_MAX_FRAMES:
+                        frames = frames[::2]
+                        frame_stride *= 2
         if progress_cb:
             progress_cb(100)
         return header, frames, flags
@@ -1264,6 +1427,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gps_port = dlg.selected_port()
         if self.gps_port:
             os.environ["GPS_PORT"] = self.gps_port
+            if dlg.remember_port():
+                with settings_lock:
+                    settings.preferred_gps_port = self.gps_port
+                save_settings()
         if self._hardware_monitor_thread is not None:
             self._hardware_monitor_thread.gps_port = self.gps_port
         self._stop_idle_gps_tracking()
@@ -1276,6 +1443,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------- Report cache ----------
     def _reset_report_cache(self):
         self.report_cache_frames = []
+        if hasattr(self, "point_inspector_stack"):
+            self._clear_point_inspector()
         self.report_cache_active = True
         self.report_cache_started_at = time.time()
         self.report_source_label = "Live Collection"
@@ -1308,8 +1477,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _get_history_points(self) -> list[dict]:
         frames = list(self.report_cache_frames or [])
+        if getattr(self, "playback_mode", False) and getattr(self, "playback_frames", None):
+            frames = list(self.playback_frames[: self.playback_index + 1])
         points = []
-        for frame in frames:
+        details: dict[str, dict] = {}
+        for frame_index, frame in enumerate(frames):
             tele = frame.get("telemetry") or {}
             if tele.get("cycle_paused"):
                 continue
@@ -1317,25 +1489,204 @@ class MainWindow(QtWidgets.QMainWindow):
             if not gps_loc:
                 continue
             try:
-                lat, lon = gps_loc
-            except Exception:
+                raw_lat, raw_lon = gps_loc
+                lat, lon = float(raw_lat), float(raw_lon)
+            except (TypeError, ValueError):
                 continue
-            points.append(
-                {
-                    "t": frame.get("t"),
-                    "lat": lat,
-                    "lon": lon,
-                    "strength": tele.get("strength"),
-                    "snr": tele.get("snr"),
-                    "quality": tele.get("quality"),
-                    "gps_fix": tele.get("gps_fix"),
-                    "sats": tele.get("sats"),
-                    "bearing_source": tele.get("bearing_source"),
-                }
-            )
+            identity_ts = tele.get("measurement_ts", frame.get("t", frame_index))
+            point_id = f"fix:{identity_ts}:{lat:.8f}:{lon:.8f}"
+            point = {
+                "point_id": point_id,
+                "t": frame.get("t"),
+                "lat": lat,
+                "lon": lon,
+                "strength": tele.get("strength"),
+                "snr": tele.get("snr"),
+                "quality": tele.get("quality"),
+                "gps_fix": tele.get("gps_fix"),
+                "sats": tele.get("sats"),
+                "bearing_source": tele.get("bearing_source"),
+            }
+            points.append(point)
+            details[point_id] = {
+                "point": {
+                    "source": "Recorded collection fix",
+                    "frame_index": frame_index,
+                    "elapsed_s": frame.get("t"),
+                    "latitude": lat,
+                    "longitude": lon,
+                },
+                "telemetry": dict(tele),
+            }
         if self._idle_gps_point and not self.collecting and not self.playback_mode:
-            points.append(dict(self._idle_gps_point))
+            point = dict(self._idle_gps_point)
+            point_id = "idle-current"
+            point["point_id"] = point_id
+            points.append(point)
+            idle_telemetry = dict(getattr(self, "latest_telemetry", {}) or {})
+            for key, value in point.items():
+                if key not in {"point_id", "location_only"}:
+                    idle_telemetry.setdefault(key, value)
+            details[point_id] = {
+                "point": {
+                    "source": "Current idle GPS fix",
+                    "observed_at": point.get("t"),
+                    "latitude": point.get("lat"),
+                    "longitude": point.get("lon"),
+                },
+                "telemetry": idle_telemetry,
+            }
+        self._map_point_details = details
+        if (
+            getattr(self, "_selected_map_point_id", None) == "idle-current"
+            and "idle-current" in details
+            and hasattr(self, "point_inspector_tree")
+        ):
+            self._show_map_point_detail("idle-current", preserve_state=True)
         return points
+
+    @staticmethod
+    def _humanize_point_field(field: object) -> str:
+        text = str(field).strip().replace("_", " ")
+        replacements = {
+            "gps": "GPS",
+            "sdr": "SDR",
+            "snr": "SNR",
+            "aoa": "AoA",
+            "hdop": "HDOP",
+            "fft": "FFT",
+            "id": "ID",
+            "ms": "ms",
+            "mhz": "MHz",
+            "deg": "deg",
+        }
+        return " ".join(replacements.get(part.lower(), part.capitalize()) for part in text.split())
+
+    @staticmethod
+    def _format_point_value(value: object, field: str = "") -> str:
+        if value is None:
+            return "--"
+        if isinstance(value, bool):
+            return "Yes" if value else "No"
+        if isinstance(value, float):
+            if field.endswith("_ts") or field in {"observed_at"}:
+                try:
+                    return datetime.datetime.fromtimestamp(value).astimezone().isoformat(timespec="milliseconds")
+                except (OSError, OverflowError, ValueError):
+                    pass
+            return f"{value:.8g}"
+        return str(value)
+
+    def _add_point_detail_tree_item(
+        self,
+        parent: QtWidgets.QTreeWidget | QtWidgets.QTreeWidgetItem,
+        field: object,
+        value: object,
+        path: tuple[str, ...] = (),
+    ) -> None:
+        label = self._humanize_point_field(field)
+        item_path = path + (label,)
+        if isinstance(value, dict):
+            item = QtWidgets.QTreeWidgetItem([label, f"{len(value)} fields"])
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole, "\x1f".join(item_path))
+            parent.addChild(item) if isinstance(parent, QtWidgets.QTreeWidgetItem) else parent.addTopLevelItem(item)
+            for child_field, child_value in value.items():
+                self._add_point_detail_tree_item(item, child_field, child_value, item_path)
+            return
+        if isinstance(value, (list, tuple)):
+            item = QtWidgets.QTreeWidgetItem([label, f"{len(value)} items"])
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole, "\x1f".join(item_path))
+            parent.addChild(item) if isinstance(parent, QtWidgets.QTreeWidgetItem) else parent.addTopLevelItem(item)
+            for index, child_value in enumerate(value):
+                child_label = f"Antenna {index + 1}" if field == "antenna_states" else f"Item {index + 1}"
+                self._add_point_detail_tree_item(item, child_label, child_value, item_path)
+            return
+        item = QtWidgets.QTreeWidgetItem([label, self._format_point_value(value, str(field))])
+        item.setData(0, QtCore.Qt.ItemDataRole.UserRole, "\x1f".join(item_path))
+        item.setToolTip(1, item.text(1))
+        parent.addChild(item) if isinstance(parent, QtWidgets.QTreeWidgetItem) else parent.addTopLevelItem(item)
+
+    def _point_inspector_expanded_paths(self) -> set[str]:
+        expanded = set()
+        iterator = QtWidgets.QTreeWidgetItemIterator(self.point_inspector_tree)
+        while iterator.value() is not None:
+            item = iterator.value()
+            if item.isExpanded():
+                path = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+                if path:
+                    expanded.add(str(path))
+            iterator += 1
+        return expanded
+
+    def _restore_point_inspector_expanded_paths(self, expanded: set[str]) -> None:
+        iterator = QtWidgets.QTreeWidgetItemIterator(self.point_inspector_tree)
+        while iterator.value() is not None:
+            item = iterator.value()
+            path = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+            item.setExpanded(bool(path and str(path) in expanded))
+            iterator += 1
+
+    def _show_map_point_detail(self, point_id: str, preserve_state: bool = False) -> None:
+        detail = self._map_point_details.get(point_id)
+        if not detail:
+            return
+        expanded = self._point_inspector_expanded_paths() if preserve_state else set()
+        scroll_bar = self.point_inspector_tree.verticalScrollBar()
+        scroll_position = scroll_bar.value() if preserve_state else 0
+        telemetry = detail.get("telemetry") or {}
+        point = detail.get("point") or {}
+        lat = point.get("latitude")
+        lon = point.get("longitude")
+        signal = telemetry.get("strength")
+        snr = telemetry.get("snr")
+        source = point.get("source", "Map fix")
+        self.point_inspector_title.setText("Selected Fix")
+        self.point_inspector_summary.setText(
+            f"{source}\n{self._format_coord_pair(lat, lon)}\n"
+            f"Signal: {self._format_point_value(signal)}  |  SNR: {self._format_point_value(snr)}"
+        )
+        self.point_inspector_tree.setUpdatesEnabled(False)
+        try:
+            self.point_inspector_tree.clear()
+            for section, value in detail.items():
+                self._add_point_detail_tree_item(self.point_inspector_tree, section, value)
+            if preserve_state:
+                self._restore_point_inspector_expanded_paths(expanded)
+                scroll_bar.setValue(min(scroll_position, scroll_bar.maximum()))
+            else:
+                self.point_inspector_tree.expandToDepth(1)
+        finally:
+            self.point_inspector_tree.setUpdatesEnabled(True)
+            self.point_inspector_tree.viewport().update()
+        self.point_inspector_stack.setCurrentWidget(self.point_inspector_content)
+
+    @staticmethod
+    def _format_coord_pair(lat: object, lon: object) -> str:
+        try:
+            return f"{float(lat):.7f}, {float(lon):.7f}"
+        except (TypeError, ValueError):
+            return "Coordinates unavailable"
+
+    def _select_map_point(self, point_id: str) -> None:
+        point_id = str(point_id)
+        if point_id not in self._map_point_details:
+            # A click can race the one-second map refresh; rebuild the cache once.
+            self._get_history_points()
+        if point_id not in self._map_point_details:
+            return
+        preserve_state = self._selected_map_point_id == point_id
+        self._selected_map_point_id = point_id
+        self._show_map_point_detail(point_id, preserve_state=preserve_state)
+
+    def _clear_point_inspector(self) -> None:
+        self._selected_map_point_id = None
+        self.point_inspector_tree.clear()
+        self.point_inspector_summary.clear()
+        self.point_inspector_stack.setCurrentWidget(self.point_inspector_blank)
+        if getattr(self, "map_view", None) is not None and getattr(self, "_map_ready", False):
+            self.map_view.page().runJavaScript(
+                "if (window.clearPointSelection) { window.clearPointSelection(); }"
+            )
 
     def _get_report_data(self) -> dict:
         with settings_lock:
@@ -1367,6 +1718,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------- Playback ----------
     def _enter_playback(self, frames: list[dict], header: Optional[dict] = None, flags: Optional[list[dict]] = None):
         self.playback_mode = True
+        self._clear_point_inspector()
         self._stop_idle_gps_tracking()
         self._idle_gps_point = None
         self.playback_frames = frames
@@ -1404,6 +1756,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._pause_playback()
         self.playback_mode = False
+        self._clear_point_inspector()
         self.playback_frames = []
         self.playback_flags = []
         self.playback_index = 0
@@ -1633,9 +1986,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.latest_cycle_paused = False
             self.latest_pause_reason = None
             self._idle_gps_point = None
+            if getattr(self, "_selected_map_point_id", None) == "idle-current":
+                self._clear_point_inspector()
             changed = changed or gps_changed
 
         if changed:
+            update_alerts = getattr(self, "_update_alert_manager", None)
+            if callable(update_alerts):
+                update_alerts({})
             self._update_info_panel()
             self._refresh_info_dialogs(force=True)
             self.update_image(force=True)
@@ -1677,6 +2035,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.latest_gps_fix = False
             self.latest_gps_loc = None
             self._idle_gps_point = None
+            if self._selected_map_point_id == "idle-current":
+                self._clear_point_inspector()
             self._update_info_panel()
             self.update_image(force=True)
 
@@ -1751,8 +2111,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _stop_recording(self):
         if self.recording_session is not None:
             try:
+                dropped_frames = self.recording_session.dropped_frames
                 self.recording_session.close()
                 logger.info("Recording saved: %s", self.recording_path)
+                if dropped_frames:
+                    logger.warning("Recording queue dropped %d frame(s).", dropped_frames)
             except Exception as e:
                 logger.error("Failed to close recording: %s", e)
             finally:
@@ -1814,6 +2177,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_telemetry(data)
 
     def _apply_telemetry(self, data: dict):
+        self.latest_telemetry = dict(data)
         gps_fix = data.get("gps_fix")
         gps_loc = data.get("gps_loc")
         sats = data.get("sats")
@@ -1834,6 +2198,12 @@ class MainWindow(QtWidgets.QMainWindow):
         map_conf = data.get("map_confidence")
         fusion_conf = data.get("fusion_confidence")
         bearing_source = data.get("bearing_source")
+        if "gps_hdop" in data:
+            self.latest_gps_hdop = data.get("gps_hdop")
+        if "gps_accuracy_m" in data:
+            self.latest_gps_accuracy_m = data.get("gps_accuracy_m")
+        if "target_estimate" in data:
+            self.latest_target_estimate = data.get("target_estimate")
         self.latest_cycle_paused = bool(data.get("cycle_paused", False))
         self.latest_pause_reason = data.get("pause_reason") if self.latest_cycle_paused else None
         if gps_loc is not None:
@@ -1894,6 +2264,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if strength is not None:
             snr_text = "--" if snr is None else f"{snr:.2f}"
             self.status_label.setText(f"Status: S={strength}  SNR={snr_text}")
+        self._update_alert_manager(data)
         self._update_info_panel()
         self._refresh_info_dialogs()
     def clear_app(self):
@@ -1908,10 +2279,73 @@ class MainWindow(QtWidgets.QMainWindow):
         reset_log_file()
 
         logger.info("Application cleared.")
+        self._clear_point_inspector()
         # Force an immediate image update
         self.update_image(force=True)
 
     # ---------- Image handling ----------
+    @staticmethod
+    def _static_point_positions(points: list[dict]) -> list[tuple[dict, float, float]]:
+        """Approximate the static renderer's auto-fit projection in normalized coordinates."""
+        valid = [p for p in points if p.get("lat") is not None and p.get("lon") is not None]
+        if not valid:
+            return []
+        lats = [float(p["lat"]) for p in valid]
+        lons = [float(p["lon"]) for p in valid]
+        min_lat, max_lat = min(lats), max(lats)
+        min_lon, max_lon = min(lons), max(lons)
+        raw_lat_span = max_lat - min_lat
+        raw_lon_span = max_lon - min_lon
+        lat_padding = raw_lat_span * 0.08 if raw_lat_span > 0.0 else 0.5e-6
+        lon_padding = raw_lon_span * 0.08 if raw_lon_span > 0.0 else 0.5e-6
+        min_lat -= lat_padding
+        max_lat += lat_padding
+        min_lon -= lon_padding
+        max_lon += lon_padding
+        lat_span = max(1e-6, max_lat - min_lat)
+        lon_span = max(1e-6, max_lon - min_lon)
+        # funcs.map's offline renderer uses a 24 px margin on an 800 x 500 image.
+        margin_x, margin_y = 24.0 / 800.0, 24.0 / 500.0
+        result = []
+        for point in valid:
+            x = margin_x + ((float(point["lon"]) - min_lon) / lon_span) * (1.0 - 2.0 * margin_x)
+            y = margin_y + ((max_lat - float(point["lat"])) / lat_span) * (1.0 - 2.0 * margin_y)
+            result.append((point, x, y))
+        return result
+
+    def _select_static_map_point(self, position: QtCore.QPointF) -> None:
+        pixmap = self.image_label.pixmap()
+        if pixmap is None or pixmap.isNull():
+            return
+        contents = self.image_label.contentsRect()
+        x0 = contents.x() + (contents.width() - pixmap.width()) / 2.0
+        y0 = contents.y() + (contents.height() - pixmap.height()) / 2.0
+        local_x = float(position.x()) - x0
+        local_y = float(position.y()) - y0
+        if local_x < 0 or local_y < 0 or local_x > pixmap.width() or local_y > pixmap.height():
+            return
+        points = [point for point in self._get_history_points() if not point.get("location_only")]
+        if HISTORY_MAX_POINTS and len(points) > HISTORY_MAX_POINTS:
+            points = points[-HISTORY_MAX_POINTS:]
+        nearest_id = None
+        nearest_distance = float("inf")
+        for point, norm_x, norm_y in self._static_point_positions(points):
+            distance = math.hypot(local_x - norm_x * pixmap.width(), local_y - norm_y * pixmap.height())
+            if distance < nearest_distance:
+                nearest_distance = distance
+                nearest_id = point.get("point_id")
+        if nearest_id is not None and nearest_distance <= 40.0:
+            self._select_map_point(str(nearest_id))
+
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if (
+            watched is self.image_label
+            and event.type() == QtCore.QEvent.Type.MouseButtonRelease
+            and event.button() == QtCore.Qt.MouseButton.LeftButton
+        ):
+            self._select_static_map_point(event.position())
+        return super().eventFilter(watched, event)
+
     def _set_map_image_bytes(self, png_bytes: bytes):
         try:
             if self.map_stack.currentWidget() != self.image_label:
@@ -2004,6 +2438,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _get_map_alerts(self) -> list[str]:
         if self.playback_mode or self.demo_active or self.playback_only or self.meshtastic_only:
             return []
+        if hasattr(self, "alert_manager"):
+            return []
         alerts = []
         if self.latest_gps_fix is False:
             alerts.append("NO FIX")
@@ -2022,9 +2458,45 @@ class MainWindow(QtWidgets.QMainWindow):
             or not getattr(self, "collecting", False)
         ):
             return []
+        if hasattr(self, "alert_manager"):
+            return []
         if getattr(self, "latest_cycle_paused", False):
             return ["PAUSED"]
         return []
+
+    def _update_alert_manager(self, data: dict) -> None:
+        with settings_lock:
+            debounce = max(1, int(settings.alert_debounce_cycles))
+        live = not (self.playback_mode or self.demo_active or self.playback_only or self.meshtastic_only)
+        antenna_states = data.get("antenna_states") or self.antenna_states or []
+        degraded = any(state.get("health") == "Degraded" for state in antenna_states)
+        accuracy = data.get("gps_accuracy_m", self.latest_gps_accuracy_m)
+        self.alert_manager.update(
+            "no_fix", live and self.latest_gps_fix is False, "NO FIX", "error", debounce
+        )
+        self.alert_manager.update(
+            "no_sdr", live and not self.sdr_connected, "NO SDR", "error", 1
+        )
+        self.alert_manager.update(
+            "sdr_error", live and bool(self.sdr_error) and self.sdr_connected,
+            "SDR ERROR", "error", 1,
+        )
+        self.alert_manager.update(
+            "paused", live and self.collecting and self.latest_cycle_paused,
+            "PAUSED", "warning", 1,
+        )
+        self.alert_manager.update(
+            "gps_accuracy", live and accuracy is not None and float(accuracy) > 25.0,
+            "LOW GPS ACCURACY", "warning", debounce,
+        )
+        self.alert_manager.update(
+            "sdr_degraded", live and degraded, "SDR DEGRADED", "warning", debounce
+        )
+
+    def _get_map_notifications(self) -> list[dict]:
+        if not hasattr(self, "alert_manager"):
+            return []
+        return self.alert_manager.snapshot()
 
     def _update_interactive_map(self, force: bool = False) -> None:
         if not self._interactive_map_enabled or not self.map_view:
@@ -2038,6 +2510,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._map_points_signature(points),
             tuple(self._get_map_alerts()),
             tuple(self._get_map_warnings()),
+            tuple((item["key"], item["severity"]) for item in self._get_map_notifications()),
+            json.dumps(self.latest_target_estimate, sort_keys=True),
         )
         now = time.time()
         if not force and (sig == self._last_map_sig) and (now - self._last_map_update) < MAP_UPDATE_INTERVAL_S:
@@ -2065,12 +2539,15 @@ class MainWindow(QtWidgets.QMainWindow):
         token_js = json.dumps(token)
         alerts_js = json.dumps(self._get_map_alerts())
         warnings_js = json.dumps(getattr(self, "_get_map_warnings", lambda: [])())
+        notifications_js = json.dumps(getattr(self, "_get_map_notifications", lambda: [])())
+        estimate_js = json.dumps(getattr(self, "latest_target_estimate", None))
         return f"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=yes" />
   <script src="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"></script>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
   <link href="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css" rel="stylesheet" />
   <style>
     html, body, #map {{ height: 100%; margin: 0; padding: 0; }}
@@ -2086,6 +2563,10 @@ class MainWindow(QtWidgets.QMainWindow):
       height: 16px;
       border: 3px solid #ffffff;
       box-shadow: 0 0 0 3px rgba(16,185,129,0.28), 0 0 8px rgba(0,0,0,0.4);
+    }}
+    .pin.selected {{
+      outline: 4px solid rgba(250, 204, 21, 0.9);
+      outline-offset: 3px;
     }}
     .popup {{
       font-family: Arial, sans-serif;
@@ -2123,6 +2604,16 @@ class MainWindow(QtWidgets.QMainWindow):
       border-color: #ffb000;
       text-shadow: 0 0 8px rgba(255, 176, 0, 0.8);
     }}
+    .system-alert.info {{
+      color: #22c55e;
+      border-color: #22c55e;
+      text-shadow: 0 0 8px rgba(34, 197, 94, 0.8);
+    }}
+    .system-alert.debug {{
+      color: #38bdf8;
+      border-color: #38bdf8;
+      text-shadow: 0 0 8px rgba(56, 189, 248, 0.8);
+    }}
   </style>
 </head>
 <body>
@@ -2138,8 +2629,17 @@ class MainWindow(QtWidgets.QMainWindow):
     }});
     map.addControl(new mapboxgl.NavigationControl());
     let markers = [];
+    let targetMarker = null;
     let activePopup = null;
     let followMode = true;
+    let selectedPointId = null;
+    let pointBridge = null;
+
+    if (typeof QWebChannel !== 'undefined' && typeof qt !== 'undefined' && qt.webChannelTransport) {{
+      new QWebChannel(qt.webChannelTransport, channel => {{
+        pointBridge = channel.objects.pointBridge || null;
+      }});
+    }}
 
     map.on('dragstart', () => {{ followMode = false; }});
     map.on('zoomstart', () => {{ followMode = false; }});
@@ -2196,19 +2696,49 @@ class MainWindow(QtWidgets.QMainWindow):
       markers = [];
     }}
 
-    function updateSystemAlerts(alerts, warnings) {{
+    function updateSystemAlerts(alerts, warnings, notifications) {{
       const container = document.getElementById('system-alerts');
       container.replaceChildren();
       const messages = [
-        ...(alerts || []).map(message => ({{ message, warning: false }})),
-        ...(warnings || []).map(message => ({{ message, warning: true }}))
+        ...(alerts || []).map(message => ({{ message, severity: 'error' }})),
+        ...(warnings || []).map(message => ({{ message, severity: 'warning' }})),
+        ...(notifications || [])
       ];
+      const seen = new Set();
       messages.forEach(item => {{
+        const message = String(item.message);
+        if (seen.has(message)) return;
+        seen.add(message);
         const alert = document.createElement('div');
-        alert.className = item.warning ? 'system-alert warning' : 'system-alert';
-        alert.textContent = String(item.message);
+        alert.className = `system-alert ${{item.severity || 'warning'}}`;
+        alert.textContent = message;
         container.appendChild(alert);
       }});
+    }}
+
+    function confidencePolygon(estimate) {{
+      if (!estimate || estimate.lat == null || estimate.lon == null || !estimate.radius_m) return null;
+      const coordinates = [];
+      const latRad = Number(estimate.lat) * Math.PI / 180.0;
+      for (let i = 0; i <= 64; i++) {{
+        const angle = (i / 64.0) * Math.PI * 2.0;
+        const dLat = (Number(estimate.radius_m) * Math.sin(angle)) / 111320.0;
+        const dLon = (Number(estimate.radius_m) * Math.cos(angle)) / Math.max(1.0, 111320.0 * Math.cos(latRad));
+        coordinates.push([Number(estimate.lon) + dLon, Number(estimate.lat) + dLat]);
+      }}
+      return {{ type: 'Feature', geometry: {{ type: 'Polygon', coordinates: [coordinates] }} }};
+    }}
+
+    function updateTargetEstimate(estimate) {{
+      if (targetMarker) {{ targetMarker.remove(); targetMarker = null; }}
+      const source = map.getSource('target-confidence');
+      const polygon = confidencePolygon(estimate);
+      if (source) source.setData(polygon || {{ type: 'FeatureCollection', features: [] }});
+      if (!estimate || estimate.lat == null || estimate.lon == null) return;
+      const el = document.createElement('div');
+      el.className = 'pin';
+      el.style.backgroundColor = '#10b981';
+      targetMarker = new mapboxgl.Marker(el).setLngLat([estimate.lon, estimate.lat]).addTo(map);
     }}
 
     function addMarkers(data) {{
@@ -2217,6 +2747,7 @@ class MainWindow(QtWidgets.QMainWindow):
         const el = document.createElement('div');
         el.className = 'pin';
         if (p.location_only) el.classList.add('current-location');
+        if (String(p.point_id) === selectedPointId) el.classList.add('selected');
         el.style.backgroundColor = p.location_only ? '#10b981' : strengthColor(p.strength);
         const marker = new mapboxgl.Marker(el).setLngLat([p.lon, p.lat]).addTo(map);
         const popup = new mapboxgl.Popup({{ closeButton: false, closeOnClick: false, offset: 18 }})
@@ -2230,6 +2761,13 @@ class MainWindow(QtWidgets.QMainWindow):
         el.addEventListener('mouseleave', () => {{
           popup.remove();
           if (activePopup === popup) activePopup = null;
+        }});
+        el.addEventListener('click', event => {{
+          event.stopPropagation();
+          selectedPointId = String(p.point_id);
+          document.querySelectorAll('.pin.selected').forEach(node => node.classList.remove('selected'));
+          el.classList.add('selected');
+          if (pointBridge && p.point_id != null) pointBridge.selectPoint(selectedPointId);
         }});
         markers.push({{ marker, popup }});
       }});
@@ -2249,8 +2787,14 @@ class MainWindow(QtWidgets.QMainWindow):
       followMode = !!enabled;
     }};
 
-    window.updateMarkers = function(data, center, forceFollow, alerts, warnings) {{
-      updateSystemAlerts(alerts, warnings);
+    window.clearPointSelection = function() {{
+      selectedPointId = null;
+      document.querySelectorAll('.pin.selected').forEach(node => node.classList.remove('selected'));
+    }};
+
+    window.updateMarkers = function(data, center, forceFollow, alerts, warnings, notifications, targetEstimate) {{
+      updateSystemAlerts(alerts, warnings, notifications);
+      updateTargetEstimate(targetEstimate);
       if (forceFollow) {{
         followMode = true;
       }}
@@ -2265,7 +2809,10 @@ class MainWindow(QtWidgets.QMainWindow):
     }};
 
     map.on('load', () => {{
-      window.updateMarkers({points_js}, {center_js}, true, {alerts_js}, {warnings_js});
+      map.addSource('target-confidence', {{ type: 'geojson', data: {{ type: 'FeatureCollection', features: [] }} }});
+      map.addLayer({{ id: 'target-confidence-fill', type: 'fill', source: 'target-confidence', paint: {{ 'fill-color': '#10b981', 'fill-opacity': 0.16 }} }});
+      map.addLayer({{ id: 'target-confidence-line', type: 'line', source: 'target-confidence', paint: {{ 'line-color': '#10b981', 'line-width': 2 }} }});
+      window.updateMarkers({points_js}, {center_js}, true, {alerts_js}, {warnings_js}, {notifications_js}, {estimate_js});
     }});
   </script>
 </body>
@@ -2276,7 +2823,9 @@ class MainWindow(QtWidgets.QMainWindow):
         center_js = json.dumps(self._map_center(points))
         alerts_js = json.dumps(self._get_map_alerts())
         warnings_js = json.dumps(getattr(self, "_get_map_warnings", lambda: [])())
-        return f"if (window.updateMarkers) {{ window.updateMarkers({points_js}, {center_js}, false, {alerts_js}, {warnings_js}); }}"
+        notifications_js = json.dumps(getattr(self, "_get_map_notifications", lambda: [])())
+        estimate_js = json.dumps(getattr(self, "latest_target_estimate", None))
+        return f"if (window.updateMarkers) {{ window.updateMarkers({points_js}, {center_js}, false, {alerts_js}, {warnings_js}, {notifications_js}, {estimate_js}); }}"
 
     def _map_center(self, points: list[dict]) -> list[float]:
         if points:
@@ -2297,17 +2846,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------- Lifecycle ----------
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        # Gracefully stop the worker if running
         try:
             self._closing = True
             self._stop_idle_gps_tracking()
             self._hardware_monitor_stop_event.set()
+            self.stop_event.set()
             if self._gps_tracking_thread is not None and self._gps_tracking_thread.isRunning():
                 self._gps_tracking_thread.wait(3500)
             if self._hardware_monitor_thread is not None and self._hardware_monitor_thread.isRunning():
                 self._hardware_monitor_thread.wait(2000)
-            if self.collecting:
-                self.stop_collection()
+            if self.thread is not None and self.thread.isRunning():
+                if not self.thread.wait(5000):
+                    logger.warning("Collector did not stop within the shutdown timeout.")
+            self.collecting = False
+            self._stop_recording()
+            self._finalize_report_cache()
             if hasattr(self, "addon_manager") and self.addon_manager:
                 self.addon_manager.shutdown()
         finally:

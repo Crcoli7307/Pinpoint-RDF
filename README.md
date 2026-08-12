@@ -46,6 +46,24 @@ Pinpoint will start even if no SDR or GPS hardware is connected. The startup dia
 3. Rescan hardware.
 4. Exit.
 
+If automatic GPS selection fails or points at the wrong serial device, the GPS configuration screen allows another COM port to be selected. Enable **Remember COM Port** to store that receiver as the default for future launches; leave it disabled to use the selection only for the current run. The same option is available from **Settings → Change GPS Port** while the application is running.
+
+**Field Data and Settings**
+
+Mutable application data is stored outside the installation directory. On Windows, Pinpoint uses `%LOCALAPPDATA%\Pinpoint` for `settings.json`, `main.log`, `map.png`, and calibration profiles. Settings persist between launches, and the application no longer requires administrator privileges solely to write runtime files.
+
+The collection cycle controls how often a telemetry cycle begins. The SDR sample window is a separate bounded capture duration (maximum two seconds), preventing accidental multi-gigabyte sample allocations. Configured SDRs are captured concurrently where the hardware permits.
+
+**Movement Pausing and GPS Accuracy**
+
+The map movement threshold is specified in meters. With adaptive movement enabled, Pinpoint increases the effective threshold using the receiver's HDOP-derived accuracy estimate and the configured multiplier. Paused cycles remain in recordings and reports but do not add map points or request a new static map.
+
+The map occupies the right side of the main workspace. The left side remains blank until a current or historical fix is selected. Clicking an interactive marker—or a marker in the static-map fallback—opens that cycle's full telemetry snapshot, including GPS data, signal/SNR, per-antenna health and measurements, movement gating, acquisition timing, bearing/fusion results, and the configured and effective calculation parameters. New recordings preserve those calculation parameters with every cycle.
+
+**Alerts**
+
+System alerts debounce transient readings and automatically disappear when their underlying condition resolves. Error, warning, informational, and debug notices render red, yellow, green, and blue respectively.
+
 **Versioning**
 All version metadata lives in `pinpoint/version.py`.
 1. `APP_VERSION` is the canonical display version.
@@ -135,11 +153,14 @@ The Diagnostics add-on provides a practical troubleshooting UI.
 2. Settings snapshot and report availability.
 3. Log file and calibration file presence checks.
 4. Live telemetry event counters.
+5. A live, smoothly scrolling SDR waterfall with per-device spectrum, power, strength, and SNR.
 
 Open it via:
 1. Add-ons menu.
 2. Diagnostics.
 3. Open Diagnostics.
+
+The waterfall is available from **Add-ons → Diagnostics → Live SDR Waterfall** while live collection telemetry is available.
 
 **Troubleshooting Guide (Field Operators)**
 1. App freezes on startup.

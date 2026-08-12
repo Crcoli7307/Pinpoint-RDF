@@ -253,6 +253,7 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
         qualities = []
         sats = []
         gps_fix = []
+        gps_accuracy = []
         antenna_stats: Dict[int, Dict[str, List[float]]] = {}
 
         for frame in frames:
@@ -274,6 +275,8 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
                     pass
             if telemetry.get("gps_fix") is not None:
                 gps_fix.append(bool(telemetry.get("gps_fix")))
+            if telemetry.get("gps_accuracy_m") is not None:
+                gps_accuracy.append(float(telemetry.get("gps_accuracy_m")))
 
             antenna_states = telemetry.get("antenna_states") or []
             for idx, st in enumerate(antenna_states):
@@ -289,6 +292,7 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
             "quality": _min_avg_max(qualities),
             "sats_avg": _avg(sats),
             "gps_fix_rate": (_avg([1.0 if f else 0.0 for f in gps_fix]) if gps_fix else None),
+            "gps_accuracy_avg_m": _avg(gps_accuracy),
         }
 
         per_ant = {}
@@ -473,13 +477,13 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
         conf_th = self._settings.get("confidence_threshold")
         p2 = (
             "During operation, the software ingests samples from software-defined radios (SDRs), "
-            "computes relative signal strengths per antenna, and estimates an angle of arrival using a weighted vector method. "
+            "computes relative signal strengths per antenna, and estimates an amplitude-derived bearing using a weighted vector method. "
             "When GPS fixes are available, it calculates a map-based bearing from position history and fuses this with the RF estimate "
             "using confidence weighting to provide a stabilized target bearing. "
         )
         weights = []
         if aoa_w is not None:
-            weights.append(f"AoA weight {aoa_w}")
+            weights.append(f"amplitude-bearing weight {aoa_w}")
         if map_w is not None:
             weights.append(f"Map weight {map_w}")
         if conf_th is not None:
@@ -590,7 +594,8 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
               <h2 class='section-title'>GPS Summary</h2>
               <div class='section-body'>
                 <p>Average satellites: {_fmt_num(overall.get("sats_avg"), 1)}<br/>
-                Fix rate: {_fmt_num((overall.get("gps_fix_rate") or 0) * 100.0, 1)}%</p>
+                Fix rate: {_fmt_num((overall.get("gps_fix_rate") or 0) * 100.0, 1)}%<br/>
+                Average estimated accuracy: {_fmt_num(overall.get("gps_accuracy_avg_m"), 1, " m")}</p>
               </div>
             </div>
             """

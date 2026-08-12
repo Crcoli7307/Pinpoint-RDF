@@ -17,6 +17,7 @@ from .sdr import (
     processSamples,
     calculateSignalStrength,
     calculateSignalQuality,
+    calculateSpectrum,
     list_sdr_devices,
 )
 from .gps import (
@@ -25,10 +26,12 @@ from .gps import (
     openGPS,
     list_serial_ports,
     readGPS,
+    get_gps_metadata,
     _safe_float,
 )
 from .map import (
     predictTransmitterLocation,
+    estimateTransmitterLocation,
     mapFunction,
 )
 
@@ -46,14 +49,17 @@ __all__ = [
     'processSamples',
     'calculateSignalStrength',
     'calculateSignalQuality',
+    'calculateSpectrum',
     'list_sdr_devices',
     'predictTransmitterLocation',
+    'estimateTransmitterLocation',
     'mapFunction',
     '_probe_nmea',
     '_find_gps_port',
     'openGPS',
     'list_serial_ports',
     'readGPS',
+    'get_gps_metadata',
     '_safe_float',
     'requests',
     'serial',

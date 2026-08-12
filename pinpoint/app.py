@@ -16,7 +16,7 @@ import sys
 
 from PyQt6 import QtCore, QtWidgets
 
-from .core import APP_TITLE, _get_app_icon
+from .core import APP_TITLE, _get_app_icon, save_settings, settings, settings_lock
 from .ui_components import GPSStartupDialog
 from .main_window import MainWindow
 
@@ -40,6 +40,9 @@ def main():
     app.setApplicationName(APP_TITLE)
     app.setWindowIcon(_get_app_icon())
 
+    if settings.preferred_gps_port and not os.environ.get("GPS_PORT"):
+        os.environ["GPS_PORT"] = settings.preferred_gps_port
+
     startup = GPSStartupDialog()
     gps_port = None
     if startup.exec() == QtWidgets.QDialog.DialogCode.Accepted:
@@ -50,6 +53,10 @@ def main():
         gps_port = startup.selected_port()
         if gps_port:
             os.environ["GPS_PORT"] = gps_port
+            if startup.remember_port():
+                with settings_lock:
+                    settings.preferred_gps_port = gps_port
+                save_settings()
 
         win = MainWindow(
             gps_port=gps_port,

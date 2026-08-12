@@ -10,5 +10,5 @@ Acts as the single source of truth for release metadata.
 
 https://nexus.crayton.dev/
 """
-APP_VERSION = "v8.0.2"
-APP_VERSION_NAME = "8.0.2"
+APP_VERSION = "v8.1.0"
+APP_VERSION_NAME = "8.1.0"

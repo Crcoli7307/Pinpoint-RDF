@@ -168,9 +168,149 @@ class DiagnosticsDialog(QtWidgets.QDialog):
         self.output.setPlainText("\n".join(lines))
 
 
+class WaterfallWidget(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(760, 420)
+        self._rows = []
+        self._scroll_offset = 0.0
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(33)
+        self._timer.timeout.connect(self._animate)
+        self._timer.start()
+
+    def add_spectrum(self, values):
+        if not values:
+            return
+        self._rows.append([float(v) for v in values])
+        self._rows = self._rows[-240:]
+        self._scroll_offset = 0.0
+        self.update()
+
+    def _animate(self):
+        if self._rows:
+            row_height = max(2.0, self.height() / 120.0)
+            self._scroll_offset += 0.22
+            if self._scroll_offset >= row_height:
+                self._rows.append(list(self._rows[-1]))
+                self._rows = self._rows[-240:]
+                self._scroll_offset = 0.0
+            self.update()
+
+    @staticmethod
+    def _color(value, minimum, maximum):
+        span = max(1e-6, maximum - minimum)
+        t = max(0.0, min(1.0, (value - minimum) / span))
+        if t < 0.33:
+            frac = t / 0.33
+            return QtGui.QColor(0, int(120 * frac), int(80 + 175 * frac))
+        if t < 0.66:
+            frac = (t - 0.33) / 0.33
+            return QtGui.QColor(int(255 * frac), int(120 + 135 * frac), int(255 * (1.0 - frac)))
+        frac = (t - 0.66) / 0.34
+        return QtGui.QColor(255, int(255 * (1.0 - frac)), 0)
+
+    def paintEvent(self, _event):
+        painter = QtGui.QPainter(self)
+        painter.fillRect(self.rect(), QtGui.QColor("#020617"))
+        if not self._rows:
+            painter.setPen(QtGui.QColor("#94a3b8"))
+            painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "Waiting for live SDR samples...")
+            return
+        values = [value for row in self._rows for value in row]
+        minimum, maximum = min(values), max(values)
+        row_height = max(2.0, self.height() / 120.0)
+        y = self.height() - row_height + self._scroll_offset
+        for row in reversed(self._rows):
+            if y < 0:
+                break
+            cell_width = self.width() / max(1, len(row))
+            for column, value in enumerate(row):
+                painter.fillRect(
+                    QtCore.QRectF(column * cell_width, y, cell_width + 1.0, row_height + 1.0),
+                    self._color(value, minimum, maximum),
+                )
+            y -= row_height
+
+
+class LiveWaterfallDialog(QtWidgets.QDialog):
+    def __init__(self, api: PinpointAPI, parent=None):
+        super().__init__(parent)
+        self._api = api
+        self._latest = {}
+        self.setWindowTitle("Live SDR Waterfall")
+        self.setMinimumSize(860, 580)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.device_combo = QtWidgets.QComboBox()
+        self.metrics = QtWidgets.QLabel("Waiting for telemetry...")
+        self.canvas = WaterfallWidget()
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(QtWidgets.QLabel("SDR"))
+        top.addWidget(self.device_combo)
+        top.addWidget(self.metrics, 1)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(top)
+        layout.addWidget(self.canvas, 1)
+        layout.addWidget(close_btn, alignment=QtCore.Qt.AlignmentFlag.AlignRight)
+        self.device_combo.currentIndexChanged.connect(self._render_latest)
+        self._token = api.subscribe("telemetry", self._on_telemetry)
+        initial = api.call("data.get_latest_telemetry").get("telemetry") or {}
+        if initial:
+            self._on_telemetry(initial)
+
+    def _on_telemetry(self, payload):
+        self._latest = dict(payload or {})
+        states = self._latest.get("antenna_states") or []
+        current = self.device_combo.currentData()
+        labels = []
+        for position, state in enumerate(states):
+            idx = state.get("index", position)
+            labels.append((idx, f"SDR {idx} — {state.get('serial') or state.get('name') or 'Unknown'}"))
+        if labels != [(self.device_combo.itemData(i), self.device_combo.itemText(i)) for i in range(self.device_combo.count())]:
+            self.device_combo.blockSignals(True)
+            self.device_combo.clear()
+            for idx, label in labels:
+                self.device_combo.addItem(label, idx)
+            match = self.device_combo.findData(current)
+            self.device_combo.setCurrentIndex(max(0, match))
+            self.device_combo.blockSignals(False)
+        self._render_latest()
+
+    def _render_latest(self):
+        states = self._latest.get("antenna_states") or []
+        selected = self.device_combo.currentData()
+        state = next((item for item in states if item.get("index") == selected), None)
+        if not state:
+            return
+        spectrum = state.get("spectrum_db") or []
+        self.canvas.add_spectrum(spectrum)
+        strength = state.get("strength")
+        power = state.get("power_dbfs")
+        snr = state.get("snr")
+        self.metrics.setText(
+            f"Strength {strength if strength is not None else '--'}  |  "
+            f"Power {power:.1f} dBFS  |  SNR {snr:.1f} dB"
+            if power is not None and snr is not None
+            else "Waiting for spectrum metrics..."
+        )
+
+    def closeEvent(self, event):
+        self._api.unsubscribe(self._token)
+        self.canvas._timer.stop()
+        super().closeEvent(event)
+
+
 def _open_diagnostics(api: PinpointAPI) -> None:
     parent = api.call("ui.get_main_window").get("window")
     dlg = DiagnosticsDialog(api, parent=parent)
+    dlg.exec()
+
+
+def _open_waterfall(api: PinpointAPI) -> None:
+    parent = api.call("ui.get_main_window").get("window")
+    dlg = LiveWaterfallDialog(api, parent=parent)
     dlg.exec()
 
 
@@ -185,6 +325,11 @@ def plugin_entry(api: PinpointAPI) -> AddonPlugin:
                 id="diagnostics_open",
                 label="Open Diagnostics...",
                 handler=_open_diagnostics,
+            ),
+            AddonAction(
+                id="diagnostics_waterfall",
+                label="Live SDR Waterfall...",
+                handler=_open_waterfall,
             ),
         ],
     )
