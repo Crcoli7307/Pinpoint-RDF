@@ -5,7 +5,7 @@ Copyright 2026 Crayton Litton. Public Domain.
 MIT License
 ---
 Implements the Diagnostics add-on dialog with system, settings, and device checks.
-Wires menu actions to open the dialog and emit test events.
+Wires the menu action used to open the dialog.
 ---
 
 https://nexus.crayton.dev/
@@ -41,14 +41,12 @@ class DiagnosticsDialog(QtWidgets.QDialog):
         self.run_btn = QtWidgets.QPushButton("Run Diagnostics")
         self.copy_btn = QtWidgets.QPushButton("Copy Report")
         self.log_btn = QtWidgets.QPushButton("Open Log")
-        self.emit_btn = QtWidgets.QPushButton("Emit Test Event")
         self.close_btn = QtWidgets.QPushButton("Close")
 
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.copy_btn)
         btn_row.addWidget(self.log_btn)
-        btn_row.addWidget(self.emit_btn)
         btn_row.addStretch(1)
         btn_row.addWidget(self.close_btn)
 
@@ -69,7 +67,6 @@ class DiagnosticsDialog(QtWidgets.QDialog):
         self.run_btn.clicked.connect(self._run_checks)
         self.copy_btn.clicked.connect(self._copy_report)
         self.log_btn.clicked.connect(self._open_log)
-        self.emit_btn.clicked.connect(self._emit_test_event)
         self.close_btn.clicked.connect(self.close)
 
         self._run_checks()
@@ -93,13 +90,6 @@ class DiagnosticsDialog(QtWidgets.QDialog):
         else:
             last = "--"
         self.summary_label.setText(f"Telemetry events: {self._telemetry_count} | Last: {last}")
-
-    def _emit_test_event(self) -> None:
-        self._api.emit("diagnostics.test", {"ts": time.time()})
-        self._api.call(
-            "ui.show_message",
-            {"title": "Diagnostics", "message": "Emitted diagnostics.test event.", "level": "info"},
-        )
 
     def _copy_report(self) -> None:
         QtWidgets.QApplication.clipboard().setText(self.output.toPlainText())
@@ -189,18 +179,12 @@ def plugin_entry(api: PinpointAPI) -> AddonPlugin:
         id="diagnostics",
         name="Diagnostics",
         version="1.0.0",
-        description="Troubleshooting checks and event-bus test utilities.",
+        description="Troubleshooting checks and system information.",
         menu=[
             AddonAction(
                 id="diagnostics_open",
                 label="Open Diagnostics...",
                 handler=_open_diagnostics,
-            ),
-            AddonAction(separator=True, id="sep"),
-            AddonAction(
-                id="diagnostics_emit",
-                label="Emit Test Event",
-                handler=lambda api_obj: api_obj.emit("diagnostics.test", {"ts": time.time()}),
             ),
         ],
     )

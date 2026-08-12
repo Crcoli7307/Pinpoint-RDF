@@ -172,6 +172,43 @@ def test_read_radio_sets_properties_and_closes():
     assert isinstance(samples, np.ndarray)
 
 
+def test_read_radio_can_reuse_existing_configuration():
+    radio = DummyRadio()
+    radio.center_freq = 90.0e6
+    radio.sample_rate = 1.0e6
+    radio.gain = 10
+
+    samples = sdr.readRadio(radio, seconds=1, frequency=100.0, gain=20, configure=False)
+
+    assert radio.center_freq == 90.0e6
+    assert radio.sample_rate == 1.0e6
+    assert radio.gain == 10
+    assert isinstance(samples, np.ndarray)
+
+
+def test_startup_gps_guess_ignores_unrelated_port(core_module, monkeypatch):
+    monkeypatch.delenv("GPS_PORT", raising=False)
+    monkeypatch.setattr(
+        core_module.funcs,
+        "list_serial_ports",
+        lambda: [{"device": "COM8", "description": "USB modem", "manufacturer": "", "hwid": ""}],
+    )
+    assert core_module._guess_gps_port_no_open() is None
+
+
+def test_hardware_check_does_not_probe_unrelated_port(core_module, monkeypatch):
+    monkeypatch.delenv("GPS_PORT", raising=False)
+    monkeypatch.setattr(
+        core_module.funcs,
+        "list_serial_ports",
+        lambda: [{"device": "COM8", "description": "USB modem", "manufacturer": "", "hwid": ""}],
+    )
+    probed = []
+    monkeypatch.setattr(core_module.funcs, "_probe_nmea", lambda port, **kwargs: probed.append(port))
+    assert core_module._detect_gps_nmea_present() is False
+    assert probed == []
+
+
 def test_list_sdr_devices(monkeypatch):
     class StubLib:
         @staticmethod
@@ -219,17 +256,40 @@ def test_find_gps_port_no_ports(monkeypatch):
         gps._find_gps_port()
 
 
-def test_find_gps_port_keyword_match(monkeypatch):
+def test_find_gps_port_keyword_without_nmea_is_rejected(monkeypatch):
     monkeypatch.setattr(gps.list_ports, "comports", lambda: [DummyPort("COM5", description="u-blox gps")])
     monkeypatch.setattr(gps, "_probe_nmea", lambda *args, **kwargs: False)
-    assert gps._find_gps_port() == "COM5"
+    with pytest.raises(Exception, match="none emitted"):
+        gps._find_gps_port()
 
 
 def test_find_gps_port_probe_success(monkeypatch):
-    ports = [DummyPort("COM3"), DummyPort("COM7")]
+    ports = [DummyPort("COM3", description="GPS receiver"), DummyPort("COM7", description="GNSS receiver")]
     monkeypatch.setattr(gps.list_ports, "comports", lambda: ports)
     monkeypatch.setattr(gps, "_probe_nmea", lambda port, **kwargs: port == "COM7")
     assert gps._find_gps_port() == "COM7"
+
+
+def test_find_gps_port_does_not_probe_unrelated_serial_port(monkeypatch):
+    monkeypatch.setattr(gps.list_ports, "comports", lambda: [DummyPort("COM8", description="USB modem")])
+    probed = []
+    monkeypatch.setattr(gps, "_probe_nmea", lambda port, **kwargs: probed.append(port))
+    with pytest.raises(Exception, match="identifies itself"):
+        gps._find_gps_port()
+    assert probed == []
+
+
+@pytest.mark.parametrize("sentence", [
+    "$GPGGA,123519,4807.038,N,01131.000,E,1,08",
+    "$GNRMC,123519,A,4807.038,N,01131.000,E",
+])
+def test_nmea_position_sentence_recognizes_standard_headers(sentence):
+    assert gps._is_nmea_position_sentence(sentence)
+
+
+def test_nmea_position_sentence_rejects_unrelated_data():
+    assert not gps._is_nmea_position_sentence("modem ready")
+    assert not gps._is_nmea_position_sentence("$GPVTG,054.7,T,034.4,M")
 
 
 def test_open_gps_uses_find(monkeypatch):
@@ -291,6 +351,552 @@ def test_read_gps_returns_fix(monkeypatch):
     assert result[1] == pytest.approx(56.78)
     assert result[2] == 7
     assert result[3][0]["prn"] == "1"
+
+
+def test_read_gps_returns_rmc_fix(monkeypatch):
+    rmc = types.SimpleNamespace(
+        sentence_type="RMC",
+        status="A",
+        latitude=12.34,
+        longitude=56.78,
+    )
+    reader = DummyNmeaReader([[rmc]])
+    serial_port = DummySerial("COM1", lines=[b"$GPRMC"])
+    monkeypatch.setattr(gps.time, "sleep", lambda _s: None)
+    result = gps.readGPS(logging.getLogger("test"), serial_port, reader, max_wait_s=1)
+    assert result[:2] == pytest.approx((12.34, 56.78))
+
+
+def test_read_gps_preserves_gsv_details_across_fix_cycles(monkeypatch):
+    gga = types.SimpleNamespace(sentence_type="GGA", num_sats=7, latitude=12.34, longitude=56.78)
+    gsv = types.SimpleNamespace(
+        sentence_type="GSV",
+        talker="GP",
+        msg_num="1",
+        sv_prn_num_1="1",
+        elevation_deg_1=10,
+        azimuth_1=20,
+        snr_1=30,
+        sv_prn_num_2=None,
+        elevation_deg_2=None,
+        azimuth_2=None,
+        snr_2=None,
+        sv_prn_num_3=None,
+        elevation_deg_3=None,
+        azimuth_3=None,
+        snr_3=None,
+        sv_prn_num_4=None,
+        elevation_deg_4=None,
+        azimuth_4=None,
+        snr_4=None,
+    )
+    rmc = types.SimpleNamespace(
+        sentence_type="RMC",
+        status="A",
+        latitude=12.34,
+        longitude=56.78,
+    )
+    reader = DummyNmeaReader([[gga], [gsv, rmc], [gga]])
+    serial_port = DummySerial("COM1", lines=[b"$GPGGA", b"$GPGSV", b"$GPGGA"])
+    monkeypatch.setattr(gps.time, "sleep", lambda _s: None)
+
+    first = gps.readGPS(logging.getLogger("test"), serial_port, reader, max_wait_s=1)
+    second = gps.readGPS(logging.getLogger("test"), serial_port, reader, max_wait_s=1)
+    third = gps.readGPS(logging.getLogger("test"), serial_port, reader, max_wait_s=1)
+
+    assert first[3] == []
+    assert second[3][0]["prn"] == "1"
+    assert third[3][0]["prn"] == "1"
+
+
+def test_gps_info_reports_satellite_count_while_waiting_for_gsv():
+    from pinpoint.ui_components import GPSInfoDialog
+
+    label_state = {}
+    dialog = types.SimpleNamespace(
+        table=types.SimpleNamespace(setRowCount=lambda count: label_state.update(rows=count)),
+        empty_label=types.SimpleNamespace(
+            setVisible=lambda visible: label_state.update(visible=visible),
+            setText=lambda value: label_state.update(text=value),
+        ),
+        polar=types.SimpleNamespace(set_satellites=lambda satellites: label_state.update(polar=satellites)),
+    )
+
+    GPSInfoDialog._set_satellites(dialog, [], satellite_count=11)
+
+    assert label_state["visible"] is True
+    assert label_state["text"] == "11 satellites used; waiting for detailed GSV data..."
+
+
+def test_read_gps_reports_connection_without_fix():
+    gga = types.SimpleNamespace(sentence_type="GGA", num_sats=0, latitude=0.0, longitude=0.0)
+    result = gps.readGPS(
+        logging.getLogger("test"),
+        DummySerial("COM1", lines=[b"$GPGGA"]),
+        DummyNmeaReader([[gga]]),
+        max_wait_s=0,
+    )
+    assert result == (None, None, 0, [])
+
+
+def test_read_gps_returns_none_after_timeout_without_nmea():
+    result = gps.readGPS(
+        logging.getLogger("test"),
+        DummySerial("COM1"),
+        DummyNmeaReader([]),
+        max_wait_s=0,
+    )
+    assert result is None
+
+
+def test_idle_gps_thread_emits_location(core_module, monkeypatch):
+    stop_event = threading.Event()
+    serial_port = DummySerial("COM7")
+    reader = DummyNmeaReader([])
+    calls = 0
+
+    monkeypatch.setattr(core_module.funcs, "openGPS", lambda port: (serial_port, reader))
+
+    def fake_read_gps(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return (12.34, 56.78, 8, [{"prn": "1"}])
+        stop_event.set()
+        return None
+
+    monkeypatch.setattr(core_module.funcs, "readGPS", fake_read_gps)
+    updates = []
+    worker = core_module.GPSLocationThread(logging.getLogger("test"), stop_event, "COM7")
+    worker.telemetry.connect(updates.append)
+    worker.run()
+
+    assert updates
+    assert updates[0]["gps_fix"] is True
+    assert updates[0]["gps_loc"] == pytest.approx((12.34, 56.78))
+    assert updates[0]["location_only"] is True
+    assert serial_port.closed is True
+
+
+def test_hardware_presence_thread_reports_selected_devices(core_module, monkeypatch):
+    stop_event = threading.Event()
+    monkeypatch.setattr(
+        core_module.funcs,
+        "list_sdr_devices",
+        lambda: [{"index": 0, "name": "RTL-SDR", "serial": "abc"}],
+    )
+    monkeypatch.setattr(
+        core_module.funcs,
+        "list_serial_ports",
+        lambda: [{"device": "COM7", "description": "GPS"}],
+    )
+    updates = []
+
+    def on_presence(sdr_present, gps_present):
+        updates.append((sdr_present, gps_present))
+        stop_event.set()
+
+    worker = core_module.HardwarePresenceThread(stop_event, gps_port="COM7", interval_s=0.25)
+    worker.presence.connect(on_presence)
+    worker.run()
+
+    assert updates == [(True, True)]
+
+
+def test_idle_hardware_presence_updates_disconnect_and_reconnect():
+    from pinpoint.main_window import MainWindow
+
+    refreshes = []
+    window = types.SimpleNamespace(
+        collecting=False,
+        demo_active=False,
+        playback_mode=False,
+        sdr_connected=True,
+        sdr_sample_rate=2.048e6,
+        sdr_error=None,
+        antenna_states=[{"connected": True}],
+        gps_port="COM7",
+        latest_gps_fix=True,
+        latest_sats=8,
+        latest_fix_age=0.0,
+        latest_satellites=[{"prn": "1"}],
+        _idle_gps_point={"lat": 12.34, "lon": 56.78},
+        _update_info_panel=lambda: refreshes.append("panel"),
+        _refresh_info_dialogs=lambda force=False: refreshes.append(("dialogs", force)),
+        update_image=lambda force=False: refreshes.append(("map", force)),
+    )
+
+    MainWindow._on_hardware_presence(window, False, False)
+    assert window.sdr_connected is False
+    assert window.sdr_sample_rate is None
+    assert window.sdr_error == "SDR disconnected"
+    assert window.latest_gps_fix is False
+    assert window._idle_gps_point is None
+    assert ("map", True) in refreshes
+
+    MainWindow._on_hardware_presence(window, True, True)
+    assert window.sdr_connected is True
+    assert window.sdr_error is None
+
+
+def test_idle_gps_thread_keeps_recent_fix_during_sentence_gap(core_module, monkeypatch):
+    stop_event = threading.Event()
+    serial_port = DummySerial("COM7")
+    calls = 0
+
+    monkeypatch.setattr(core_module.funcs, "openGPS", lambda port: (serial_port, object()))
+
+    def fake_read_gps(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return (12.34, 56.78, 8, [])
+        if calls == 2:
+            return None
+        stop_event.set()
+        return None
+
+    monkeypatch.setattr(core_module.funcs, "readGPS", fake_read_gps)
+    updates = []
+    worker = core_module.GPSLocationThread(logging.getLogger("test"), stop_event, "COM7")
+    worker.telemetry.connect(updates.append)
+    worker.run()
+
+    assert len(updates) == 2
+    assert updates[0]["gps_fix"] is True
+    assert updates[1]["gps_fix"] is True
+    assert updates[1]["gps_loc"] == pytest.approx((12.34, 56.78))
+
+
+def test_gps_fix_expires_only_after_stale_window(core_module):
+    last_fix = (12.34, 56.78)
+    assert core_module._gps_fix_is_current(last_fix, 100.0, now=114.9) is True
+    assert core_module._gps_fix_is_current(last_fix, 100.0, now=115.1) is False
+
+
+def test_gps_distance_is_measured_in_meters(core_module):
+    assert core_module._distance_m(0.0, 0.0, 0.0, 0.001) == pytest.approx(111.2, abs=0.2)
+
+
+def test_settings_include_map_movement_threshold(core_module):
+    configured = core_module.Settings(movement_threshold_m=12.5)
+    assert configured.to_dict()["movement_threshold_m"] == pytest.approx(12.5)
+
+
+def test_collector_keeps_sdr_configured_and_gps_fixed(core_module, monkeypatch):
+    stop_event = threading.Event()
+    radio = DummyRadio()
+    configure_calls = []
+
+    monkeypatch.setattr(
+        core_module.funcs,
+        "list_sdr_devices",
+        lambda: [{"index": 0, "name": "RTL-SDR", "serial": "abc"}],
+    )
+    monkeypatch.setattr(core_module.funcs, "selectRadio", lambda _index: radio)
+    monkeypatch.setattr(core_module.funcs, "openGPS", lambda port=None: (DummySerial(port or "COM7"), object()))
+    monkeypatch.setattr(
+        core_module.funcs,
+        "readGPS",
+        lambda **_kwargs: (12.34, 56.78, None, []),
+    )
+
+    def fake_read_radio(_radio, _seconds, _frequency, _gain, configure=True):
+        configure_calls.append(configure)
+        if configure:
+            radio.sample_rate = 2.048e6
+        return np.array([1 + 1j, 2 + 2j])
+
+    monkeypatch.setattr(core_module.funcs, "readRadio", fake_read_radio)
+    monkeypatch.setattr(core_module.funcs, "mapFunction", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(core_module.time, "sleep", lambda _seconds: None)
+
+    updates = []
+
+    def on_telemetry(data):
+        updates.append(data)
+        if len(updates) >= 2:
+            stop_event.set()
+
+    worker = core_module.CollectorThread(logging.getLogger("test"), stop_event, gps_port="COM7")
+    worker.telemetry.connect(on_telemetry)
+    worker.run()
+
+    assert configure_calls == [True, False]
+    assert all(update["sdr_connected"] is True for update in updates)
+    assert all(update["gps_fix"] is True for update in updates)
+
+
+def test_collector_pauses_map_until_movement_reaches_threshold(core_module, monkeypatch):
+    stop_event = threading.Event()
+    radio = DummyRadio()
+    fixes = iter(
+        [
+            (35.0, -80.0, 8, []),
+            (35.00002, -80.0, 8, []),
+            (35.00006, -80.0, 8, []),
+        ]
+    )
+    map_histories = []
+
+    monkeypatch.setattr(core_module.settings, "movement_threshold_m", 5.0)
+    monkeypatch.setattr(core_module, "MAP_UPDATE_INTERVAL_S", 0.0)
+    monkeypatch.setattr(
+        core_module.funcs,
+        "list_sdr_devices",
+        lambda: [{"index": 0, "name": "RTL-SDR", "serial": "abc"}],
+    )
+    monkeypatch.setattr(core_module.funcs, "selectRadio", lambda _index: radio)
+    monkeypatch.setattr(core_module.funcs, "openGPS", lambda port=None: (DummySerial(port or "COM7"), object()))
+    monkeypatch.setattr(core_module.funcs, "readGPS", lambda **_kwargs: next(fixes))
+    monkeypatch.setattr(
+        core_module.funcs,
+        "readRadio",
+        lambda *_args, **_kwargs: np.array([1 + 1j, 2 + 2j]),
+    )
+    monkeypatch.setattr(
+        core_module.funcs,
+        "mapFunction",
+        lambda history, *_args, **_kwargs: map_histories.append(dict(history)),
+    )
+    monkeypatch.setattr(core_module.time, "sleep", lambda _seconds: None)
+
+    updates = []
+
+    def on_telemetry(data):
+        updates.append(data)
+        if len(updates) >= 3:
+            stop_event.set()
+
+    worker = core_module.CollectorThread(logging.getLogger("test"), stop_event, gps_port="COM7")
+    worker.telemetry.connect(on_telemetry)
+    worker.run()
+
+    assert [update["cycle_paused"] for update in updates] == [False, True, False]
+    assert updates[1]["pause_reason"] == "Insufficient Movement, Paused Cycle"
+    assert updates[1]["gps_loc"] == pytest.approx((35.00002, -80.0))
+    assert updates[1]["movement_distance_m"] < 5.0
+    assert updates[2]["movement_distance_m"] >= 5.0
+    assert len(map_histories) == 2
+    assert len(map_histories[0]) == 1
+    assert len(map_histories[1]) == 2
+
+
+def test_collector_switches_gps_port_without_stopping(core_module, monkeypatch):
+    stop_event = threading.Event()
+    radio = DummyRadio()
+    opened_ports = []
+    serial_ports = []
+
+    monkeypatch.setattr(
+        core_module.funcs,
+        "list_sdr_devices",
+        lambda: [{"index": 0, "name": "RTL-SDR", "serial": "abc"}],
+    )
+    monkeypatch.setattr(core_module.funcs, "selectRadio", lambda _index: radio)
+
+    def fake_open_gps(port=None):
+        opened_ports.append(port)
+        serial_port = DummySerial(port)
+        serial_ports.append(serial_port)
+        return serial_port, object()
+
+    monkeypatch.setattr(core_module.funcs, "openGPS", fake_open_gps)
+    monkeypatch.setattr(core_module.funcs, "readGPS", lambda **_kwargs: (12.34, 56.78, 8, []))
+    monkeypatch.setattr(
+        core_module.funcs,
+        "readRadio",
+        lambda *_args, **_kwargs: np.array([1 + 1j, 2 + 2j]),
+    )
+    monkeypatch.setattr(core_module.funcs, "mapFunction", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(core_module.time, "sleep", lambda _seconds: None)
+
+    updates = []
+    worker = core_module.CollectorThread(logging.getLogger("test"), stop_event, gps_port="COM7")
+
+    def on_telemetry(data):
+        updates.append(data)
+        if len(updates) == 1:
+            worker.request_gps_port("COM9")
+        elif len(updates) == 2:
+            stop_event.set()
+
+    worker.telemetry.connect(on_telemetry)
+    worker.run()
+
+    assert opened_ports == ["COM7", "COM9"]
+    assert serial_ports[0].closed is True
+    assert len(updates) == 2
+
+
+def test_change_gps_port_updates_running_collector(monkeypatch):
+    import pinpoint.main_window as main_window_mod
+
+    requested = []
+
+    class FakeWizard:
+        def __init__(self, parent=None, current_port=None):
+            assert current_port == "COM7"
+
+        def exec(self):
+            return main_window_mod.QtWidgets.QDialog.DialogCode.Accepted
+
+        def selected_port(self):
+            return "COM9"
+
+    monkeypatch.setattr(main_window_mod, "GPSSetupWizard", FakeWizard)
+    monitor = types.SimpleNamespace(gps_port="COM7")
+    collector = types.SimpleNamespace(request_gps_port=lambda port: requested.append(port))
+    refreshed = []
+    window = types.SimpleNamespace(
+        playback_mode=False,
+        demo_active=False,
+        playback_only=False,
+        meshtastic_only=False,
+        gps_port="COM7",
+        _hardware_monitor_thread=monitor,
+        latest_gps_fix=True,
+        latest_sats=8,
+        latest_fix_age=0.0,
+        latest_satellites=[{"prn": "1"}],
+        _idle_gps_point={"lat": 12.34, "lon": 56.78},
+        current_bearing=90.0,
+        last_status_msg="Collecting",
+        collecting=True,
+        thread=collector,
+        _stop_idle_gps_tracking=lambda: None,
+        _start_idle_gps_tracking=lambda: None,
+        _update_info_panel=lambda: refreshed.append("panel"),
+        _refresh_info_dialogs=lambda force=False: refreshed.append(("dialogs", force)),
+        update_image=lambda force=False: refreshed.append(("map", force)),
+    )
+
+    main_window_mod.MainWindow.change_gps_port(window)
+
+    assert window.gps_port == "COM9"
+    assert monitor.gps_port == "COM9"
+    assert requested == ["COM9"]
+    assert window.latest_gps_fix is False
+    assert window._idle_gps_point is None
+    assert ("map", True) in refreshed
+
+
+def test_idle_gps_point_is_not_part_of_active_collection():
+    from pinpoint.main_window import MainWindow
+
+    window = types.SimpleNamespace(
+        report_cache_frames=[],
+        _idle_gps_point={"lat": 12.34, "lon": 56.78, "location_only": True},
+        collecting=False,
+        playback_mode=False,
+    )
+    assert MainWindow._get_history_points(window) == [window._idle_gps_point]
+
+    window.collecting = True
+    assert MainWindow._get_history_points(window) == []
+
+
+def test_paused_cycles_are_kept_out_of_interactive_map_history():
+    from pinpoint.main_window import MainWindow
+
+    window = types.SimpleNamespace(
+        report_cache_frames=[
+            {"t": 0.0, "telemetry": {"gps_loc": (1.0, 2.0), "strength": 100}},
+            {
+                "t": 2.0,
+                "telemetry": {
+                    "gps_loc": (1.00001, 2.0),
+                    "strength": 200,
+                    "cycle_paused": True,
+                },
+            },
+        ],
+        _idle_gps_point=None,
+        collecting=True,
+        playback_mode=False,
+    )
+
+    points = MainWindow._get_history_points(window)
+    assert [(point["lat"], point["lon"]) for point in points] == [(1.0, 2.0)]
+
+
+def test_interactive_map_urgent_alert_states():
+    from pinpoint.main_window import MainWindow
+
+    window = types.SimpleNamespace(
+        playback_mode=False,
+        demo_active=False,
+        playback_only=False,
+        meshtastic_only=False,
+        latest_gps_fix=False,
+        sdr_connected=False,
+        sdr_error=None,
+    )
+    assert MainWindow._get_map_alerts(window) == ["NO FIX", "NO SDR"]
+
+    window.sdr_connected = True
+    window.sdr_error = "read failed"
+    assert MainWindow._get_map_alerts(window) == ["NO FIX", "SDR ERROR"]
+
+    window.playback_mode = True
+    assert MainWindow._get_map_alerts(window) == []
+
+
+def test_interactive_map_paused_warning_state():
+    from pinpoint.main_window import MainWindow
+
+    window = types.SimpleNamespace(
+        playback_mode=False,
+        demo_active=False,
+        playback_only=False,
+        meshtastic_only=False,
+        collecting=True,
+        latest_cycle_paused=True,
+    )
+    assert MainWindow._get_map_warnings(window) == ["PAUSED"]
+
+    window.collecting = False
+    assert MainWindow._get_map_warnings(window) == []
+
+
+def test_interactive_map_html_contains_alert_overlay():
+    from pinpoint.main_window import MainWindow
+
+    window = types.SimpleNamespace(
+        _map_center=lambda _points: [0.0, 0.0],
+        _get_map_alerts=lambda: ["NO FIX", "NO SDR"],
+    )
+    html = MainWindow._build_map_html(window, "token", [])
+    assert 'id="system-alerts"' in html
+    assert ".system-alert" in html
+    assert 'true, ["NO FIX", "NO SDR"]' in html
+
+
+def test_report_cycle_marks_insufficient_movement_pause():
+    from addons.report_generator import ReportGeneratorDialog
+
+    dialog = types.SimpleNamespace(
+        _frames=[
+            {
+                "t": 0.0,
+                "telemetry": {
+                    "strength": 100,
+                    "snr": 2.0,
+                    "gps_fix": True,
+                    "cycle_paused": True,
+                    "pause_reason": "Insufficient Movement, Paused Cycle",
+                },
+            }
+        ],
+        cycle_len_input=types.SimpleNamespace(value=lambda: 2),
+        _cycles_cache=None,
+        _cycles_cache_key=None,
+    )
+    dialog._frames_cache_key = types.MethodType(ReportGeneratorDialog._frames_cache_key, dialog)
+
+    cycles = ReportGeneratorDialog._collect_cycles(dialog)
+    assert cycles[0]["paused_samples"] == 1
+    assert cycles[0]["status"] == "Insufficient Movement, Paused Cycle"
 
 
 def test_safe_float():

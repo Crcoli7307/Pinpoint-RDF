@@ -104,7 +104,6 @@ Copy this into `addons/my_addon.py` and reload add-ons from the UI.
 ```python
 from __future__ import annotations
 
-import time
 from PyQt6 import QtWidgets
 from pinpoint.plugin_api import AddonAction, AddonPlugin, PinpointAPI
 
@@ -126,12 +125,6 @@ def plugin_entry(api: PinpointAPI) -> AddonPlugin:
         description="Example add-on template.",
         menu=[
             AddonAction(id="open", label="Open Dialog", handler=_open_dialog, enabled=_enabled),
-            AddonAction(separator=True, id="sep"),
-            AddonAction(
-                id="emit_event",
-                label="Emit Test Event",
-                handler=lambda api_obj: api_obj.emit("diagnostics.test", {"ts": time.time()}),
-            ),
         ],
     )
 ```
@@ -142,7 +135,6 @@ The Diagnostics add-on provides a practical troubleshooting UI.
 2. Settings snapshot and report availability.
 3. Log file and calibration file presence checks.
 4. Live telemetry event counters.
-5. A test event emitter for validating the event bus.
 
 Open it via:
 1. Add-ons menu.

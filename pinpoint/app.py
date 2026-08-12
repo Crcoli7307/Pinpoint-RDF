@@ -16,7 +16,7 @@ import sys
 
 from PyQt6 import QtCore, QtWidgets
 
-from .core import APP_TITLE, _get_app_icon, _show_startup_splash
+from .core import APP_TITLE, _get_app_icon
 from .ui_components import GPSStartupDialog
 from .main_window import MainWindow
 
@@ -39,8 +39,6 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
     app.setWindowIcon(_get_app_icon())
-
-    _show_startup_splash(app)
 
     startup = GPSStartupDialog()
     gps_port = None

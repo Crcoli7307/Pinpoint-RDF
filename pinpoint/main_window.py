@@ -132,6 +132,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Mode", "mode"),
             ("Activity", "activity"),
             ("GPS", "gps"),
+            ("Coordinates", "coordinates"),
             ("Satellites", "sats"),
             ("Fix Age", "fix_age"),
             ("SDR", "sdr"),
@@ -234,6 +235,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.collecting = False
         self.stop_event = threading.Event()
         self.thread: CollectorThread | None = None
+        self._gps_tracking_stop_event = threading.Event()
+        self._gps_tracking_thread: GPSLocationThread | None = None
+        self._hardware_monitor_stop_event = threading.Event()
+        self._hardware_monitor_thread: HardwarePresenceThread | None = None
+        self._collection_start_pending = False
+        self._demo_start_pending = False
+        self._idle_gps_point: Optional[dict] = None
+        self._closing = False
         self.demo_active = False
         self._demo_start_state: Optional[dict] = None
         self._demo_config: Optional[dict] = None
@@ -267,12 +276,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_info_dialog_refresh = 0.0
         self.latest_satellites = []
         self.latest_gps_fix = None
+        self.latest_gps_loc = None
         self.latest_sats = None
         self.latest_fix_age = None
         self.latest_strength = None
         self.latest_snr = None
         self.latest_quality = None
-        self.sdr_connected = True
+        self.latest_cycle_paused = False
+        self.latest_pause_reason = None
+        try:
+            self.sdr_connected = bool(funcs.list_sdr_devices())
+        except Exception:
+            self.sdr_connected = False
         self.sdr_error = None
         self.sdr_sample_rate = None
         self.antenna_count = settings.antenna_count
@@ -297,6 +312,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_start_state(label, "primary", enabled=False)
             if hasattr(self, "start_action") and self.start_action:
                 self.start_action.setEnabled(False)
+        elif self.gps_port:
+            QtCore.QTimer.singleShot(0, self._start_idle_gps_tracking)
+        QtCore.QTimer.singleShot(0, self._start_hardware_presence_monitor)
 
     # ---------- UI helpers ----------
     def _build_menus(self):
@@ -326,6 +344,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.antenna_info_action.triggered.connect(self.open_antenna_info)
         self.settings_action = QtGui.QAction("Update Settings", self)
         self.settings_action.triggered.connect(self.open_settings)
+        self.gps_port_action = QtGui.QAction("Change GPS Port...", self)
+        self.gps_port_action.triggered.connect(self.change_gps_port)
 
         self.start_action = QtGui.QAction("Start Data Collection", self)
         self.start_action.triggered.connect(self.toggle_collection)
@@ -342,6 +362,7 @@ class MainWindow(QtWidgets.QMainWindow):
         view_menu.addAction(self.gps_info_action)
         view_menu.addAction(self.antenna_info_action)
         settings_menu.addAction(self.settings_action)
+        settings_menu.addAction(self.gps_port_action)
 
         collection_menu.addAction(self.start_action)
         collection_menu.addAction(self.clear_action)
@@ -555,6 +576,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.flag_btn.setEnabled(flag_active)
 
         activity = getattr(self, "last_status_msg", None) or ("Collecting" if self.collecting else "Idle")
+        if self.collecting and self.latest_cycle_paused:
+            activity = self.latest_pause_reason or "Insufficient Movement, Paused Cycle"
 
         gps_text = "--"
         if self.latest_gps_fix is True:
@@ -564,9 +587,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         sats_text = "--" if self.latest_sats is None else str(self.latest_sats)
         fix_age_text = "--" if self.latest_fix_age is None else f"{self.latest_fix_age:.0f}s"
+        coordinates_text = "--"
+        if self.latest_gps_loc is not None:
+            try:
+                coordinates_text = f"{float(self.latest_gps_loc[0]):.6f}, {float(self.latest_gps_loc[1]):.6f}"
+            except (TypeError, ValueError, IndexError):
+                coordinates_text = "--"
 
         sdr_text = "Connected" if self.sdr_connected else "No SDR"
-        if self.sdr_sample_rate:
+        if self.sdr_connected and self.sdr_sample_rate:
             sdr_text += f" @ {self.sdr_sample_rate/1e6:.2f}MS/s"
         if self.sdr_error:
             sdr_text += " (Err)"
@@ -600,6 +629,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._info_values["mode"].setText(mode)
         self._info_values["activity"].setText(activity)
         self._info_values["gps"].setText(gps_text)
+        self._info_values["coordinates"].setText(coordinates_text)
         self._info_values["sats"].setText(sats_text)
         self._info_values["fix_age"].setText(fix_age_text)
         self._info_values["sdr"].setText(sdr_text)
@@ -689,6 +719,50 @@ class MainWindow(QtWidgets.QMainWindow):
     def open_settings(self):
         SettingsDialog(self).exec()
         self._refresh_map_mode(force=True)
+
+    def change_gps_port(self) -> None:
+        if self.playback_mode or self.demo_active or self.playback_only or self.meshtastic_only:
+            QtWidgets.QMessageBox.information(
+                self,
+                "GPS Port",
+                "Exit playback or demo mode before changing the live GPS receiver.",
+            )
+            return
+
+        wizard = GPSSetupWizard(self, current_port=self.gps_port)
+        if wizard.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        port = wizard.selected_port()
+        if not port:
+            return
+
+        old_port = self.gps_port
+        self.gps_port = port
+        os.environ["GPS_PORT"] = port
+        if self._hardware_monitor_thread is not None:
+            self._hardware_monitor_thread.gps_port = port
+
+        self.latest_gps_fix = False
+        self.latest_gps_loc = None
+        self.latest_sats = None
+        self.latest_fix_age = None
+        self.latest_satellites = []
+        self.latest_cycle_paused = False
+        self.latest_pause_reason = None
+        self._idle_gps_point = None
+        self.current_bearing = None
+        self.last_status_msg = f"Switching GPS to {port}"
+
+        if self.collecting and self.thread is not None and hasattr(self.thread, "request_gps_port"):
+            self.thread.request_gps_port(port)
+        else:
+            self._stop_idle_gps_tracking()
+            QtCore.QTimer.singleShot(0, self._start_idle_gps_tracking)
+
+        logger.info("GPS port changed from %s to %s.", old_port or "none", port)
+        self._update_info_panel()
+        self._refresh_info_dialogs(force=True)
+        self.update_image(force=True)
 
     def open_log(self):
         LogWindow(self).exec()
@@ -808,7 +882,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return True
 
     def open_gps_info(self):
-        dlg = GPSInfoDialog(self._get_latest_satellites, self._get_info_refresh_s, self)
+        dlg = GPSInfoDialog(self._get_gps_satellite_info, self._get_info_refresh_s, self)
         self._gps_info_dialog = dlg
         try:
             dlg.exec()
@@ -817,6 +891,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _get_latest_satellites(self):
         return list(self.latest_satellites or [])
+
+    def _get_gps_satellite_info(self):
+        return {
+            "satellites": self._get_latest_satellites(),
+            "count": self.latest_sats,
+        }
 
     def _get_info_refresh_s(self):
         with settings_lock:
@@ -988,6 +1068,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._finish_stop_ui()
         # Now that the thread has fully finished, release the reference.
         self.thread = None
+        QtCore.QTimer.singleShot(0, self._start_idle_gps_tracking)
 
     def _capture_start_state(self) -> dict:
         return {
@@ -1061,6 +1142,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._finish_demo_ui()
 
     def _start_demo_thread(self) -> None:
+        if self._gps_tracking_thread is not None and self._gps_tracking_thread.isRunning():
+            self._demo_start_pending = True
+            self._stop_idle_gps_tracking()
+            return
+        self._demo_start_pending = False
+        self._idle_gps_point = None
+        self.update_image(force=True)
         self.stop_event.clear()
         self.thread = DemoCollectorThread(
             logger=logger,
@@ -1086,6 +1174,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._finish_demo_ui()
         self._demo_stopped = False
         self.thread = None
+        QtCore.QTimer.singleShot(0, self._start_idle_gps_tracking)
 
     def _finish_demo_ui(self) -> None:
         if not self.demo_active and not self._demo_start_state:
@@ -1151,6 +1240,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if dlg.playback_only():
             self.playback_only = True
             self.meshtastic_only = False
+            self._stop_idle_gps_tracking()
+            self._idle_gps_point = None
             self._set_start_state("Playback Only", "primary", enabled=False)
             if hasattr(self, "start_action") and self.start_action:
                 self.start_action.setEnabled(False)
@@ -1160,6 +1251,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if dlg.meshtastic_only():
             self.meshtastic_only = True
             self.playback_only = False
+            self._stop_idle_gps_tracking()
+            self._idle_gps_point = None
             self._set_start_state("Meshtastic Only", "primary", enabled=False)
             if hasattr(self, "start_action") and self.start_action:
                 self.start_action.setEnabled(False)
@@ -1171,10 +1264,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gps_port = dlg.selected_port()
         if self.gps_port:
             os.environ["GPS_PORT"] = self.gps_port
+        if self._hardware_monitor_thread is not None:
+            self._hardware_monitor_thread.gps_port = self.gps_port
+        self._stop_idle_gps_tracking()
         self._set_start_state("Start Data Collection", "primary", enabled=True)
         if hasattr(self, "start_action") and self.start_action:
             self.start_action.setEnabled(True)
         self._update_info_panel()
+        QtCore.QTimer.singleShot(0, self._start_idle_gps_tracking)
 
     # ---------- Report cache ----------
     def _reset_report_cache(self):
@@ -1214,6 +1311,8 @@ class MainWindow(QtWidgets.QMainWindow):
         points = []
         for frame in frames:
             tele = frame.get("telemetry") or {}
+            if tele.get("cycle_paused"):
+                continue
             gps_loc = tele.get("gps_loc")
             if not gps_loc:
                 continue
@@ -1234,6 +1333,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     "bearing_source": tele.get("bearing_source"),
                 }
             )
+        if self._idle_gps_point and not self.collecting and not self.playback_mode:
+            points.append(dict(self._idle_gps_point))
         return points
 
     def _get_report_data(self) -> dict:
@@ -1266,6 +1367,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------- Playback ----------
     def _enter_playback(self, frames: list[dict], header: Optional[dict] = None, flags: Optional[list[dict]] = None):
         self.playback_mode = True
+        self._stop_idle_gps_tracking()
+        self._idle_gps_point = None
         self.playback_frames = frames
         self.playback_flags = list(flags or [])
         self.playback_index = 0
@@ -1322,6 +1425,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_map_mode(force=True)
         if hasattr(self, "api") and self.api:
             self.api.emit("playback.stopped", {"ts": time.time()})
+        QtCore.QTimer.singleShot(0, self._start_idle_gps_tracking)
 
     def _toggle_playback(self):
         if not self.playback_mode or not self.playback_frames:
@@ -1457,7 +1561,153 @@ class MainWindow(QtWidgets.QMainWindow):
         m, s = divmod(seconds, 60)
         return f"{m:02d}:{s:02d}"
 
+    def _start_idle_gps_tracking(self) -> None:
+        if (
+            self._closing
+            or self.collecting
+            or self.demo_active
+            or self.playback_mode
+            or self.playback_only
+            or self.meshtastic_only
+            or not self.gps_port
+        ):
+            return
+        if self._gps_tracking_thread is not None:
+            if self._gps_tracking_thread.isRunning():
+                return
+            self._gps_tracking_thread = None
+
+        self._gps_tracking_stop_event.clear()
+        self._gps_tracking_thread = GPSLocationThread(
+            logger=logger,
+            stop_event=self._gps_tracking_stop_event,
+            gps_port=self.gps_port,
+            parent=self,
+        )
+        self._gps_tracking_thread.telemetry.connect(self._on_idle_gps_telemetry)
+        self._gps_tracking_thread.error.connect(self._on_idle_gps_error)
+        self._gps_tracking_thread.finished.connect(self._on_idle_gps_finished)
+        self._gps_tracking_thread.start()
+
+    def _start_hardware_presence_monitor(self) -> None:
+        if self._closing:
+            return
+        if self._hardware_monitor_thread is not None:
+            if self._hardware_monitor_thread.isRunning():
+                self._hardware_monitor_thread.gps_port = self.gps_port
+                return
+            self._hardware_monitor_thread = None
+
+        self._hardware_monitor_stop_event.clear()
+        self._hardware_monitor_thread = HardwarePresenceThread(
+            stop_event=self._hardware_monitor_stop_event,
+            gps_port=self.gps_port,
+            interval_s=1.0,
+            parent=self,
+        )
+        self._hardware_monitor_thread.presence.connect(self._on_hardware_presence)
+        self._hardware_monitor_thread.finished.connect(self._on_hardware_monitor_finished)
+        self._hardware_monitor_thread.start()
+
+    def _on_hardware_presence(self, sdr_present: bool, gps_present: bool) -> None:
+        if self.collecting or self.demo_active or self.playback_mode:
+            return
+
+        changed = self.sdr_connected != sdr_present
+        if changed:
+            self.sdr_connected = sdr_present
+            self.sdr_sample_rate = None
+            if sdr_present:
+                self.sdr_error = None
+            else:
+                self.sdr_error = "SDR disconnected"
+                self.antenna_states = []
+
+        if self.gps_port and not gps_present:
+            gps_changed = self.latest_gps_fix is not False or self._idle_gps_point is not None
+            self.latest_gps_fix = False
+            self.latest_gps_loc = None
+            self.latest_sats = None
+            self.latest_fix_age = None
+            self.latest_satellites = []
+            self.latest_cycle_paused = False
+            self.latest_pause_reason = None
+            self._idle_gps_point = None
+            changed = changed or gps_changed
+
+        if changed:
+            self._update_info_panel()
+            self._refresh_info_dialogs(force=True)
+            self.update_image(force=True)
+
+    def _on_hardware_monitor_finished(self) -> None:
+        thread = self._hardware_monitor_thread
+        self._hardware_monitor_thread = None
+        if thread is not None:
+            thread.deleteLater()
+
+    def _stop_idle_gps_tracking(self) -> None:
+        self._gps_tracking_stop_event.set()
+
+    def _on_idle_gps_telemetry(self, data: dict) -> None:
+        if self.collecting or self.demo_active or self.playback_mode:
+            return
+        gps_loc = data.get("gps_loc")
+        if gps_loc:
+            try:
+                lat, lon = gps_loc
+                self._idle_gps_point = {
+                    "t": time.time(),
+                    "lat": lat,
+                    "lon": lon,
+                    "sats": data.get("sats"),
+                    "gps_fix": data.get("gps_fix"),
+                    "fix_age_s": data.get("fix_age_s"),
+                    "location_only": True,
+                }
+            except (TypeError, ValueError):
+                pass
+        self._apply_telemetry(data)
+        if hasattr(self, "api") and self.api:
+            self.api.emit("gps.position", data)
+
+    def _on_idle_gps_error(self, error: str) -> None:
+        logger.warning("Idle GPS tracking error: %s", error)
+        if not self.collecting and not self.demo_active and not self.playback_mode:
+            self.latest_gps_fix = False
+            self.latest_gps_loc = None
+            self._idle_gps_point = None
+            self._update_info_panel()
+            self.update_image(force=True)
+
+    def _on_idle_gps_finished(self) -> None:
+        thread = self._gps_tracking_thread
+        self._gps_tracking_thread = None
+        if thread is not None:
+            thread.deleteLater()
+
+        if self._closing:
+            return
+        if self._collection_start_pending:
+            self._collection_start_pending = False
+            if self.collecting:
+                QtCore.QTimer.singleShot(0, self._start_collection_thread)
+                return
+        if self._demo_start_pending:
+            self._demo_start_pending = False
+            if self.demo_active:
+                QtCore.QTimer.singleShot(0, self._start_demo_thread)
+                return
+        QtCore.QTimer.singleShot(0, self._start_idle_gps_tracking)
+
     def _start_collection_thread(self):
+        if self._gps_tracking_thread is not None and self._gps_tracking_thread.isRunning():
+            self._collection_start_pending = True
+            self._stop_idle_gps_tracking()
+            return
+        self._collection_start_pending = False
+        self._idle_gps_point = None
+        self.update_image(force=True)
         self.stop_event.clear()
         self.thread = CollectorThread(logger=logger, stop_event=self.stop_event, gps_port=self.gps_port)
         self.thread.status.connect(self._on_thread_status)
@@ -1565,6 +1815,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_telemetry(self, data: dict):
         gps_fix = data.get("gps_fix")
+        gps_loc = data.get("gps_loc")
         sats = data.get("sats")
         fix_age = data.get("fix_age_s")
         strength = data.get("strength")
@@ -1583,7 +1834,11 @@ class MainWindow(QtWidgets.QMainWindow):
         map_conf = data.get("map_confidence")
         fusion_conf = data.get("fusion_confidence")
         bearing_source = data.get("bearing_source")
-        if satellites is not None:
+        self.latest_cycle_paused = bool(data.get("cycle_paused", False))
+        self.latest_pause_reason = data.get("pause_reason") if self.latest_cycle_paused else None
+        if gps_loc is not None:
+            self.latest_gps_loc = gps_loc
+        if satellites:
             self.latest_satellites = satellites
         if strength is not None:
             self.latest_strength = strength
@@ -1591,11 +1846,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.latest_snr = snr
         if quality is not None:
             self.latest_quality = quality
-        if sdr_connected is not None:
+        if "sdr_connected" in data:
             self.sdr_connected = bool(sdr_connected)
-        if sdr_error is not None:
+        if "sdr_error" in data:
             self.sdr_error = sdr_error
-        if sdr_sample_rate is not None:
+        if "sdr_sample_rate" in data:
             self.sdr_sample_rate = sdr_sample_rate
         if antenna_count is not None:
             self.antenna_count = int(antenna_count)
@@ -1615,13 +1870,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self.fusion_confidence = fusion_conf
         if bearing_source is not None:
             self.bearing_source = bearing_source
-        if gps_fix is not None:
-            self.latest_gps_fix = bool(gps_fix)
+        effective_gps_fix = gps_fix
+        if (
+            not effective_gps_fix
+            and gps_loc is not None
+            and fix_age is not None
+            and fix_age <= GPS_FIX_STALE_S
+        ):
+            effective_gps_fix = True
+        if effective_gps_fix is not None:
+            self.latest_gps_fix = bool(effective_gps_fix)
         if sats is not None:
             self.latest_sats = sats
         if fix_age is not None:
             self.latest_fix_age = fix_age
-        if gps_fix:
+        if effective_gps_fix:
             self.gps_label.setText(f"GPS: FIX (sats={sats})")
         else:
             if fix_age is not None:
@@ -1632,6 +1895,7 @@ class MainWindow(QtWidgets.QMainWindow):
             snr_text = "--" if snr is None else f"{snr:.2f}"
             self.status_label.setText(f"Status: S={strength}  SNR={snr_text}")
         self._update_info_panel()
+        self._refresh_info_dialogs()
     def clear_app(self):
         # Reset map image
         try:
@@ -1737,6 +2001,31 @@ class MainWindow(QtWidgets.QMainWindow):
             last.get("strength"),
         )
 
+    def _get_map_alerts(self) -> list[str]:
+        if self.playback_mode or self.demo_active or self.playback_only or self.meshtastic_only:
+            return []
+        alerts = []
+        if self.latest_gps_fix is False:
+            alerts.append("NO FIX")
+        if not self.sdr_connected:
+            alerts.append("NO SDR")
+        elif self.sdr_error:
+            alerts.append("SDR ERROR")
+        return alerts
+
+    def _get_map_warnings(self) -> list[str]:
+        if (
+            getattr(self, "playback_mode", False)
+            or getattr(self, "demo_active", False)
+            or getattr(self, "playback_only", False)
+            or getattr(self, "meshtastic_only", False)
+            or not getattr(self, "collecting", False)
+        ):
+            return []
+        if getattr(self, "latest_cycle_paused", False):
+            return ["PAUSED"]
+        return []
+
     def _update_interactive_map(self, force: bool = False) -> None:
         if not self._interactive_map_enabled or not self.map_view:
             return
@@ -1745,7 +2034,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._disable_interactive_map()
             return
         points = self._get_history_points()
-        sig = self._map_points_signature(points)
+        sig = (
+            self._map_points_signature(points),
+            tuple(self._get_map_alerts()),
+            tuple(self._get_map_warnings()),
+        )
         now = time.time()
         if not force and (sig == self._last_map_sig) and (now - self._last_map_update) < MAP_UPDATE_INTERVAL_S:
             return
@@ -1770,6 +2063,8 @@ class MainWindow(QtWidgets.QMainWindow):
         points_js = json.dumps(points)
         center_js = json.dumps(center)
         token_js = json.dumps(token)
+        alerts_js = json.dumps(self._get_map_alerts())
+        warnings_js = json.dumps(getattr(self, "_get_map_warnings", lambda: [])())
         return f"""<!doctype html>
 <html>
 <head>
@@ -1786,14 +2081,53 @@ class MainWindow(QtWidgets.QMainWindow):
       border: 2px solid #ffffff;
       box-shadow: 0 0 6px rgba(0,0,0,0.35);
     }}
+    .pin.current-location {{
+      width: 16px;
+      height: 16px;
+      border: 3px solid #ffffff;
+      box-shadow: 0 0 0 3px rgba(16,185,129,0.28), 0 0 8px rgba(0,0,0,0.4);
+    }}
     .popup {{
       font-family: Arial, sans-serif;
       font-size: 12px;
+    }}
+    #system-alerts {{
+      position: absolute;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 20;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      pointer-events: none;
+    }}
+    .system-alert {{
+      color: #ff1f1f;
+      background: rgba(20, 20, 20, 0.88);
+      border: 3px solid #ff1f1f;
+      border-radius: 8px;
+      padding: 8px 22px;
+      font-family: Arial, sans-serif;
+      font-size: 32px;
+      font-weight: 900;
+      line-height: 1.05;
+      letter-spacing: 1.5px;
+      text-align: center;
+      text-shadow: 0 0 8px rgba(255, 31, 31, 0.8);
+      box-shadow: 0 3px 12px rgba(0, 0, 0, 0.5);
+    }}
+    .system-alert.warning {{
+      color: #ffb000;
+      border-color: #ffb000;
+      text-shadow: 0 0 8px rgba(255, 176, 0, 0.8);
     }}
   </style>
 </head>
 <body>
   <div id="map"></div>
+  <div id="system-alerts" role="alert" aria-live="assertive"></div>
   <script>
     mapboxgl.accessToken = {token_js};
     const map = new mapboxgl.Map({{
@@ -1804,6 +2138,7 @@ class MainWindow(QtWidgets.QMainWindow):
     }});
     map.addControl(new mapboxgl.NavigationControl());
     let markers = [];
+    let activePopup = null;
     let followMode = true;
 
     map.on('dragstart', () => {{ followMode = false; }});
@@ -1822,6 +2157,18 @@ class MainWindow(QtWidgets.QMainWindow):
     function popupHtml(p) {{
       const lat = (p.lat ?? '--');
       const lon = (p.lon ?? '--');
+      if (p.location_only) {{
+        const sats = (p.sats ?? '--');
+        const fixAge = p.fix_age_s == null ? '--' : `${{Number(p.fix_age_s).toFixed(1)}}s`;
+        return `
+          <div class="popup">
+            <div><strong>Current GPS Location</strong></div>
+            <div><strong>Lat:</strong> ${{lat}}</div>
+            <div><strong>Lon:</strong> ${{lon}}</div>
+            <div><strong>Satellites:</strong> ${{sats}}</div>
+            <div><strong>Fix age:</strong> ${{fixAge}}</div>
+          </div>`;
+      }}
       const strength = (p.strength ?? '--');
       const snr = (p.snr ?? '--');
       const quality = (p.quality ?? '--');
@@ -1838,8 +2185,30 @@ class MainWindow(QtWidgets.QMainWindow):
     }}
 
     function clearMarkers() {{
-      markers.forEach(m => m.marker.remove());
+      if (activePopup) {{
+        activePopup.remove();
+        activePopup = null;
+      }}
+      markers.forEach(m => {{
+        m.popup.remove();
+        m.marker.remove();
+      }});
       markers = [];
+    }}
+
+    function updateSystemAlerts(alerts, warnings) {{
+      const container = document.getElementById('system-alerts');
+      container.replaceChildren();
+      const messages = [
+        ...(alerts || []).map(message => ({{ message, warning: false }})),
+        ...(warnings || []).map(message => ({{ message, warning: true }}))
+      ];
+      messages.forEach(item => {{
+        const alert = document.createElement('div');
+        alert.className = item.warning ? 'system-alert warning' : 'system-alert';
+        alert.textContent = String(item.message);
+        container.appendChild(alert);
+      }});
     }}
 
     function addMarkers(data) {{
@@ -1847,13 +2216,21 @@ class MainWindow(QtWidgets.QMainWindow):
         if (p.lat == null || p.lon == null) return;
         const el = document.createElement('div');
         el.className = 'pin';
-        el.style.backgroundColor = strengthColor(p.strength);
+        if (p.location_only) el.classList.add('current-location');
+        el.style.backgroundColor = p.location_only ? '#10b981' : strengthColor(p.strength);
         const marker = new mapboxgl.Marker(el).setLngLat([p.lon, p.lat]).addTo(map);
         const popup = new mapboxgl.Popup({{ closeButton: false, closeOnClick: false, offset: 18 }})
           .setLngLat([p.lon, p.lat])
           .setHTML(popupHtml(p));
-        el.addEventListener('mouseenter', () => popup.addTo(map));
-        el.addEventListener('mouseleave', () => popup.remove());
+        el.addEventListener('mouseenter', () => {{
+          if (activePopup && activePopup !== popup) activePopup.remove();
+          activePopup = popup;
+          popup.addTo(map);
+        }});
+        el.addEventListener('mouseleave', () => {{
+          popup.remove();
+          if (activePopup === popup) activePopup = null;
+        }});
         markers.push({{ marker, popup }});
       }});
     }}
@@ -1872,7 +2249,8 @@ class MainWindow(QtWidgets.QMainWindow):
       followMode = !!enabled;
     }};
 
-    window.updateMarkers = function(data, center, forceFollow) {{
+    window.updateMarkers = function(data, center, forceFollow, alerts, warnings) {{
+      updateSystemAlerts(alerts, warnings);
       if (forceFollow) {{
         followMode = true;
       }}
@@ -1887,7 +2265,7 @@ class MainWindow(QtWidgets.QMainWindow):
     }};
 
     map.on('load', () => {{
-      window.updateMarkers({points_js}, {center_js}, true);
+      window.updateMarkers({points_js}, {center_js}, true, {alerts_js}, {warnings_js});
     }});
   </script>
 </body>
@@ -1896,7 +2274,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_map_update_js(self, points: list[dict]) -> str:
         points_js = json.dumps(points)
         center_js = json.dumps(self._map_center(points))
-        return f"if (window.updateMarkers) {{ window.updateMarkers({points_js}, {center_js}, false); }}"
+        alerts_js = json.dumps(self._get_map_alerts())
+        warnings_js = json.dumps(getattr(self, "_get_map_warnings", lambda: [])())
+        return f"if (window.updateMarkers) {{ window.updateMarkers({points_js}, {center_js}, false, {alerts_js}, {warnings_js}); }}"
 
     def _map_center(self, points: list[dict]) -> list[float]:
         if points:
@@ -1919,6 +2299,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         # Gracefully stop the worker if running
         try:
+            self._closing = True
+            self._stop_idle_gps_tracking()
+            self._hardware_monitor_stop_event.set()
+            if self._gps_tracking_thread is not None and self._gps_tracking_thread.isRunning():
+                self._gps_tracking_thread.wait(3500)
+            if self._hardware_monitor_thread is not None and self._hardware_monitor_thread.isRunning():
+                self._hardware_monitor_thread.wait(2000)
             if self.collecting:
                 self.stop_collection()
             if hasattr(self, "addon_manager") and self.addon_manager:

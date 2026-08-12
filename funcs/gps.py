@@ -12,11 +12,23 @@ https://nexus.crayton.dev/
 """
 
 import os
+import re
 import time
 
 import serial
 from pynmea2 import NMEAStreamReader
 from serial.tools import list_ports
+
+_NMEA_POSITION_HEADER = re.compile(r"^\$[A-Z0-9]{2}(?:GGA|RMC)$", re.IGNORECASE)
+
+
+def _is_nmea_position_sentence(line):
+    """Return whether *line* looks like a standard GGA or RMC NMEA sentence."""
+    if not isinstance(line, str):
+        return False
+    header, separator, _payload = line.strip().partition(",")
+    return bool(separator and _NMEA_POSITION_HEADER.fullmatch(header))
+
 
 def _probe_nmea(port_name, baudrate=9600, timeout=0.5, probe_seconds=4.0):
     """
@@ -36,8 +48,7 @@ def _probe_nmea(port_name, baudrate=9600, timeout=0.5, probe_seconds=4.0):
                 line = ""
             if not line:
                 continue
-            # Basic NMEA sentence check
-            if line.startswith("$") and (",GGA" in line or ",RMC" in line):
+            if _is_nmea_position_sentence(line):
                 return True
         return False
     finally:
@@ -83,7 +94,18 @@ def _find_gps_port(baudrate=9600):
         if any(k in haystack for k in gps_keywords):
             keyword_matches.append(p.device)
 
-    candidates = keyword_matches if keyword_matches else [p.device for p in ports]
+    candidates = keyword_matches
+
+    if not candidates:
+        port_list = ", ".join(
+            f"{p.device} ({(p.description or '').strip()})"
+            for p in ports
+        )
+        raise Exception(
+            "No serial port identifies itself as a GPS/GNSS receiver. "
+            "Select the GPS COM port manually or set GPS_PORT. "
+            f"Detected ports: {port_list}"
+        )
 
     # Try common GPS baud rates to improve auto-detection.
     baudrates_to_try = [baudrate, 9600, 4800, 38400, 115200]
@@ -97,30 +119,14 @@ def _find_gps_port(baudrate=9600):
             if _probe_nmea(dev, baudrate=br):
                 return dev
 
-    # If only one obvious GPS-like device exists, assume it.
-    if keyword_matches and len(keyword_matches) == 1:
-        return keyword_matches[0]
-
-    if len(candidates) == 1:
-        return candidates[0]
-
-    # If there's exactly one non-default USB serial port, assume it's the GPS.
-    # This helps u-blox devices that are quiet until they have a fix.
-    non_default = [p.device for p in ports if (p.device or "").upper() not in ("COM1", "COM2")]
-    usb_serial = [p.device for p in ports if "usb serial" in (p.description or "").lower()]
-    if len(non_default) == 1:
-        return non_default[0]
-    if len(usb_serial) == 1:
-        return usb_serial[0]
-
     # Include a compact port listing to help field operators.
     port_list = ", ".join(
         f"{p.device} ({(p.description or '').strip()})"
         for p in ports
     )
     raise Exception(
-        "Unable to identify GPS COM port. "
-        "Set GPS_PORT to the correct COM port (e.g., COM5) and retry. "
+        "GPS/GNSS ports were found, but none emitted GGA or RMC NMEA data. "
+        "Select the correct COM port manually or set GPS_PORT. "
         f"Detected ports: {port_list}"
     )
 
@@ -150,6 +156,24 @@ def list_serial_ports():
         )
     return ports
 
+
+def _gps_reader_state(nmea_reader):
+    state = getattr(nmea_reader, "_pinpoint_state", None)
+    if not isinstance(state, dict):
+        state = {"satellites_by_talker": {}, "last_num_sats": None}
+        try:
+            setattr(nmea_reader, "_pinpoint_state", state)
+        except Exception:
+            pass
+    return state
+
+
+def _cached_satellites(reader_state):
+    satellites = []
+    for talker_satellites in reader_state.get("satellites_by_talker", {}).values():
+        satellites.extend(talker_satellites.values())
+    return satellites
+
 def readGPS(logger, serial_port=None, nmea_reader=None, stop_event=None, max_wait_s=10):
     """
     Read latitude and longitude from a USB GPS receiver using PyNMEA.
@@ -158,12 +182,14 @@ def readGPS(logger, serial_port=None, nmea_reader=None, stop_event=None, max_wai
         tuple: (LAT, LON, num_sats, satellites) when a valid fix is received, or None on timeout/stop.
     """
     created_port = False
-    satellites_by_prn = {}
-    last_num_sats = None
+    position_data_seen = False
     try:
         if serial_port is None or nmea_reader is None:
             serial_port, nmea_reader = openGPS()
             created_port = True
+        reader_state = _gps_reader_state(nmea_reader)
+        satellites_by_talker = reader_state["satellites_by_talker"]
+        last_num_sats = reader_state.get("last_num_sats")
         start_time = time.time()
         while True:
             if stop_event is not None and stop_event.is_set():
@@ -172,6 +198,10 @@ def readGPS(logger, serial_port=None, nmea_reader=None, stop_event=None, max_wai
             for msg in nmea_reader.next(data):
                 if msg.sentence_type == 'GSV':
                     # Satellites in view; gather per-satellite info when available
+                    talker = str(getattr(msg, "talker", "") or "")
+                    satellites_by_prn = satellites_by_talker.setdefault(talker, {})
+                    if str(getattr(msg, "msg_num", "")).strip() == "1":
+                        satellites_by_prn.clear()
                     for i in range(1, 5):
                         prn = getattr(msg, f"sv_prn_num_{i}", None)
                         if not prn:
@@ -190,21 +220,32 @@ def readGPS(logger, serial_port=None, nmea_reader=None, stop_event=None, max_wai
                             "snr": _safe_float(snr),
                         }
                 if msg.sentence_type == 'GGA':
+                    position_data_seen = True
                     logger.info(f"Number of satellites: {msg.num_sats}")
                     last_num_sats = msg.num_sats
+                    reader_state["last_num_sats"] = last_num_sats
                     if msg.latitude != 0.0 and msg.longitude != 0.0:
                         latitude = msg.latitude
                         longitude = msg.longitude
-                        satellites = list(satellites_by_prn.values())
+                        satellites = _cached_satellites(reader_state)
                         return (latitude, longitude, msg.num_sats, satellites)
                     else:
                         logger.debug("Waiting for valid coordinates...")
+                elif msg.sentence_type == 'RMC':
+                    position_data_seen = True
+                    if (
+                        getattr(msg, "status", "A") == "A"
+                        and msg.latitude != 0.0
+                        and msg.longitude != 0.0
+                    ):
+                        satellites = _cached_satellites(reader_state)
+                        return (msg.latitude, msg.longitude, last_num_sats, satellites)
                 time.sleep(0.1)
-            # If we timed out but have satellite data, return it with no fix.
-            if max_wait_s is not None and (time.time() - start_time) > max_wait_s:
-                if satellites_by_prn or last_num_sats is not None:
-                    satellites = list(satellites_by_prn.values())
+            if max_wait_s is not None and (time.time() - start_time) >= max_wait_s:
+                satellites = _cached_satellites(reader_state)
+                if position_data_seen or satellites or last_num_sats is not None:
                     return (None, None, last_num_sats, satellites)
+                return None
     except Exception as e:
         raise Exception(f"Error reading GPS: {e}")
     finally:

@@ -41,7 +41,7 @@ def selectRadio(index=0):
     except Exception as e:
         raise Exception(f"Error initializing SDR: {e}")
 
-def readRadio(radio, seconds, frequency, gain=30, close_radio=False):
+def readRadio(radio, seconds, frequency, gain=30, close_radio=False, configure=True):
     """
     Read samples from the SDR device.
     
@@ -53,9 +53,10 @@ def readRadio(radio, seconds, frequency, gain=30, close_radio=False):
     Returns:
         numpy_array: Samples from the SDR device.
     """
-    radio.center_freq = frequency * 1e6  # Convert MHz to Hz
-    radio.sample_rate = 2.048e6          # Sample rate (default)
-    radio.gain = gain                    # Auto gain
+    if configure:
+        radio.center_freq = frequency * 1e6  # Convert MHz to Hz
+        radio.sample_rate = 2.048e6          # Sample rate (default)
+        radio.gain = gain
     
     try:
         samples = radio.read_samples(seconds * int(radio.sample_rate))

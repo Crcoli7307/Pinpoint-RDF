@@ -346,7 +346,7 @@ def _status_anim_for_mode(mode: str) -> Optional[str]:
 def _guess_gps_port_no_open() -> Optional[str]:
     """
     Best-effort GPS port detection without opening the serial device.
-    This avoids locking/permission issues during the splash screen.
+    This avoids locking or permission issues during startup checks.
     """
     try:
         env_port = os.environ.get("GPS_PORT")
@@ -374,20 +374,8 @@ def _guess_gps_port_no_open() -> Optional[str]:
             if any(k in haystack for k in gps_keywords):
                 keyword_matches.append(p.get("device"))
 
-        candidates = keyword_matches if keyword_matches else [p.get("device") for p in ports]
-        candidates = [c for c in candidates if c]
-
         if len(keyword_matches) == 1:
             return keyword_matches[0]
-        if len(candidates) == 1:
-            return candidates[0]
-
-        non_default = [p.get("device") for p in ports if (p.get("device") or "").upper() not in ("COM1", "COM2")]
-        usb_serial = [p.get("device") for p in ports if "usb serial" in (p.get("description") or "").lower()]
-        if len(non_default) == 1:
-            return non_default[0]
-        if len(usb_serial) == 1:
-            return usb_serial[0]
 
         return None
     except Exception:
@@ -410,7 +398,7 @@ def _detect_gps_nmea_present() -> bool:
             if (p.get("device") or "").upper() == env_port.upper():
                 candidates = [p.get("device")]
                 break
-    if not candidates:
+    elif not candidates:
         gps_keywords = ("gps", "u-blox", "ublox", "gnss", "nmea")
         keyword_matches = []
         for p in ports:
@@ -424,14 +412,7 @@ def _detect_gps_nmea_present() -> bool:
             ).lower()
             if any(k in haystack for k in gps_keywords):
                 keyword_matches.append(p.get("device"))
-        if keyword_matches:
-            candidates = keyword_matches
-        else:
-            candidates = [
-                p.get("device")
-                for p in ports
-                if (p.get("device") or "").upper() not in ("COM1", "COM2")
-            ]
+        candidates = keyword_matches
 
     candidates = [c for c in candidates if c]
     if not candidates:
@@ -571,6 +552,7 @@ HISTORY_MAX_POINTS = _env_int("HISTORY_MAX_POINTS", 150)
 HISTORY_MAX_AGE_S = _env_float("HISTORY_MAX_AGE_S", 3600.0)
 REPORT_CACHE_MAX_FRAMES = _env_int("REPORT_CACHE_MAX_FRAMES", 5000)
 GPS_MAX_WAIT_S = 10
+GPS_FIX_STALE_S = _env_float("GPS_FIX_STALE_S", 15.0)
 SDR_SCAN_INTERVAL_S = 5.0
 SDR_DEFAULT_SAMPLE_RATE = 2.048e6
 HARDWARE_CHECK_TIMEOUT_S = 6.0
@@ -593,7 +575,6 @@ LOADING_ANIM_IMPORT = _resource_path("assets", "gifs", "import_file.gif")
 LOADING_ICON_PX = 64
 GIF_WHITE_THRESHOLD = 245
 GIF_TRANSPARENT_KEY = (255, 0, 255)
-SPLASH_DURATION_MS = 5000
 FLAG_REASON_OPTIONS = [
     "Entering Search Area",
     "Signal Spike",
@@ -666,6 +647,7 @@ class Settings:
     antenna_count: int = 2
     antenna_spacing_in: float = 0.0  # 0 = auto (half-wavelength)
     info_refresh_s: int = 3
+    movement_threshold_m: float = 5.0
     calibration_profile: str = "default"
     fusion_aoa_weight: float = 0.7
     fusion_map_weight: float = 0.3
@@ -680,6 +662,7 @@ class Settings:
             "antenna_count": self.antenna_count,
             "antenna_spacing_in": self.antenna_spacing_in,
             "info_refresh_s": self.info_refresh_s,
+            "movement_threshold_m": self.movement_threshold_m,
             "calibration_profile": self.calibration_profile,
             "fusion_aoa_weight": self.fusion_aoa_weight,
             "fusion_map_weight": self.fusion_map_weight,
@@ -718,28 +701,16 @@ def _apply_app_icon(widget: QtWidgets.QWidget) -> None:
         pass
 
 
-def _show_startup_splash(app: QtWidgets.QApplication, duration_ms: int = SPLASH_DURATION_MS) -> None:
-    try:
-        if not os.path.exists(PINPOINT_IMAGE_FALLBACK):
-            return
-        pixmap = QtGui.QPixmap(PINPOINT_IMAGE_FALLBACK)
-        if pixmap.isNull():
-            return
-        splash = QtWidgets.QSplashScreen(pixmap)
-        _apply_app_icon(splash)
-        splash.setWindowFlag(QtCore.Qt.WindowType.WindowStaysOnTopHint, True)
-        splash.show()
-        app.processEvents()
-        loop = QtCore.QEventLoop()
-        QtCore.QTimer.singleShot(duration_ms, loop.quit)
-        loop.exec()
-        splash.close()
-        app.processEvents()
-    except Exception:
-        logging.getLogger().debug("Failed to show startup splash screen.", exc_info=True)
-
 def _normalize_bearing(deg: float) -> float:
     return (deg + 360.0) % 360.0
+
+
+def _gps_fix_is_current(last_fix, last_fix_time, now: Optional[float] = None) -> bool:
+    if last_fix is None or last_fix_time is None:
+        return False
+    if now is None:
+        now = time.time()
+    return max(0.0, now - last_fix_time) <= GPS_FIX_STALE_S
 
 
 def _relative_bearing(target_deg: Optional[float], current_deg: Optional[float]) -> Optional[float]:
@@ -759,6 +730,23 @@ def _bearing_deg(lat1, lon1, lat2, lon2) -> Optional[float]:
         bearing = math.degrees(math.atan2(y, x))
         return _normalize_bearing(bearing)
     except Exception:
+        return None
+
+
+def _distance_m(lat1, lon1, lat2, lon2) -> Optional[float]:
+    """Return the great-circle distance between two GPS coordinates in meters."""
+    try:
+        phi1 = math.radians(float(lat1))
+        phi2 = math.radians(float(lat2))
+        dphi = phi2 - phi1
+        dlon = math.radians(float(lon2) - float(lon1))
+        a = (
+            math.sin(dphi / 2.0) ** 2
+            + math.cos(phi1) * math.cos(phi2) * math.sin(dlon / 2.0) ** 2
+        )
+        a = max(0.0, min(1.0, a))
+        return 6_371_000.0 * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -1218,6 +1206,147 @@ class DemoCollectorThread(QtCore.QThread):
             self.status.emit("stopped")
 
 
+class HardwarePresenceThread(QtCore.QThread):
+    """Polls device enumeration without opening either receiver."""
+
+    presence = QtCore.pyqtSignal(bool, bool)
+
+    def __init__(
+        self,
+        stop_event: threading.Event,
+        gps_port: Optional[str] = None,
+        interval_s: float = 1.0,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.stop_event = stop_event
+        self.gps_port = gps_port
+        self.interval_s = max(0.25, float(interval_s))
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                sdr_present = bool(funcs.list_sdr_devices())
+            except Exception:
+                sdr_present = False
+
+            gps_present = False
+            gps_port = self.gps_port
+            if gps_port:
+                try:
+                    gps_present = any(
+                        (port.get("device") or "").upper() == gps_port.upper()
+                        for port in funcs.list_serial_ports()
+                    )
+                except Exception:
+                    gps_present = False
+
+            self.presence.emit(sdr_present, gps_present)
+            if self.stop_event.wait(self.interval_s):
+                break
+
+
+class _AnyStopEvent:
+    """Minimal event facade that becomes set when any source event is set."""
+
+    def __init__(self, *events):
+        self.events = events
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self.events)
+
+
+class GPSLocationThread(QtCore.QThread):
+    """Reads receiver position while full SDR data collection is idle."""
+
+    telemetry = QtCore.pyqtSignal(dict)
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, logger: logging.Logger, stop_event: threading.Event, gps_port: str, parent=None):
+        super().__init__(parent)
+        self.logger = logger
+        self.stop_event = stop_event
+        self.gps_port = gps_port
+
+    def run(self):
+        gps_serial = None
+        gps_reader = None
+        last_fix = None
+        last_fix_time = None
+        last_satellites = []
+        retry_delay_s = 2.0
+        try:
+            while not self.stop_event.is_set():
+                if gps_serial is None or gps_reader is None:
+                    try:
+                        gps_serial, gps_reader = funcs.openGPS(port=self.gps_port)
+                        self.logger.info("Idle GPS tracking connected on %s.", self.gps_port)
+                    except Exception as exc:
+                        self.error.emit(str(exc))
+                        if self.stop_event.wait(retry_delay_s):
+                            break
+                        continue
+
+                try:
+                    result = funcs.readGPS(
+                        logger=self.logger,
+                        serial_port=gps_serial,
+                        nmea_reader=gps_reader,
+                        stop_event=self.stop_event,
+                        max_wait_s=2,
+                    )
+                except Exception as exc:
+                    self.error.emit(str(exc))
+                    try:
+                        gps_serial.close()
+                    except Exception:
+                        pass
+                    gps_serial = None
+                    gps_reader = None
+                    if self.stop_event.wait(retry_delay_s):
+                        break
+                    continue
+
+                if self.stop_event.is_set():
+                    break
+
+                num_sats = None
+                satellites = last_satellites
+                if result is not None:
+                    lat, lon = result[0], result[1]
+                    num_sats = result[2]
+                    satellites = result[3] if len(result) > 3 else []
+                    if satellites:
+                        last_satellites = satellites
+                    else:
+                        satellites = last_satellites
+                    if lat is not None and lon is not None:
+                        last_fix = (lat, lon)
+                        last_fix_time = time.time()
+
+                fix_age = None
+                if last_fix_time is not None:
+                    fix_age = max(0.0, time.time() - last_fix_time)
+                has_fix = _gps_fix_is_current(last_fix, last_fix_time)
+                self.telemetry.emit(
+                    {
+                        "gps_fix": has_fix,
+                        "gps_loc": last_fix,
+                        "sats": num_sats,
+                        "fix_age_s": fix_age,
+                        "satellites": satellites,
+                        "location_only": True,
+                    }
+                )
+        finally:
+            if gps_serial is not None:
+                try:
+                    gps_serial.close()
+                except Exception:
+                    self.logger.debug("Failed to close idle GPS serial cleanly.", exc_info=True)
+            self.logger.info("Idle GPS tracking stopped.")
+
+
 class CollectorThread(QtCore.QThread):
     """Runs the record loop without freezing the UI."""
 
@@ -1230,7 +1359,25 @@ class CollectorThread(QtCore.QThread):
         self.logger = logger
         self.stop_event = stop_event
         self.gps_port = gps_port
+        self._gps_port_lock = threading.Lock()
+        self._requested_gps_port = gps_port
+        self._gps_port_change_event = threading.Event()
+        self._gps_read_stop_event = _AnyStopEvent(self.stop_event, self._gps_port_change_event)
         self.radio_index = 0
+
+    def request_gps_port(self, port: str) -> None:
+        with self._gps_port_lock:
+            self._requested_gps_port = port
+        self._gps_port_change_event.set()
+
+    def _consume_gps_port_change(self) -> Optional[str]:
+        if not self._gps_port_change_event.is_set():
+            return None
+        with self._gps_port_lock:
+            port = self._requested_gps_port
+            self.gps_port = port
+            self._gps_port_change_event.clear()
+        return port
 
     def run(self):
         history = {}
@@ -1242,6 +1389,7 @@ class CollectorThread(QtCore.QThread):
         last_fix_time = None
         last_satellites = []
         prev_fix = None
+        last_mapped_fix = None
         current_bearing = None
         target_bearing = None
         target_relative = None
@@ -1272,6 +1420,7 @@ class CollectorThread(QtCore.QThread):
                     "error": None,
                     "name": d.get("name"),
                     "serial": d.get("serial"),
+                    "configuration": None,
                     "sample_rate": None,
                     "strength": None,
                     "snr": None,
@@ -1280,6 +1429,25 @@ class CollectorThread(QtCore.QThread):
             last_sdr_scan = time.time()
             while not self.stop_event.is_set():
                 try:
+                    changed_gps_port = self._consume_gps_port_change()
+                    if changed_gps_port is not None:
+                        if gps_serial is not None:
+                            try:
+                                gps_serial.close()
+                            except Exception:
+                                self.logger.debug("Failed to close previous GPS port.", exc_info=True)
+                        gps_serial = None
+                        gps_reader = None
+                        last_fix = None
+                        last_fix_time = None
+                        last_satellites = []
+                        prev_fix = None
+                        last_mapped_fix = None
+                        current_bearing = None
+                        gps_failures = 0
+                        gps_next_retry = 0.0
+                        self.logger.info("Switching GPS receiver to %s.", changed_gps_port)
+
                     # take a thread-safe snapshot of settings
                     with settings_lock:
                         s = settings.to_dict()
@@ -1299,6 +1467,7 @@ class CollectorThread(QtCore.QThread):
                                     "error": None,
                                     "name": d.get("name"),
                                     "serial": d.get("serial"),
+                                    "configuration": None,
                                     "sample_rate": None,
                                     "strength": None,
                                     "snr": None,
@@ -1314,6 +1483,7 @@ class CollectorThread(QtCore.QThread):
                                 state["radio"] = funcs.selectRadio(idx)
                                 state["connected"] = True
                                 state["error"] = None
+                                state["configuration"] = None
                                 self.logger.info("SDR index %s connected", idx)
                             except Exception as e:
                                 state["connected"] = False
@@ -1341,9 +1511,11 @@ class CollectorThread(QtCore.QThread):
                                 logger=self.logger,
                                 serial_port=gps_serial,
                                 nmea_reader=gps_reader,
-                                stop_event=self.stop_event,
+                                stop_event=self._gps_read_stop_event,
                                 max_wait_s=GPS_MAX_WAIT_S,
                             )
+                            if self._gps_port_change_event.is_set():
+                                continue
                         except Exception as e:
                             self.logger.warning("GPS read error; resetting GPS: %s", e)
                             try:
@@ -1357,6 +1529,7 @@ class CollectorThread(QtCore.QThread):
                             gps_next_retry = time.time() + backoff
                             self.status.emit("GPS error; reconnecting")
                             gps_data = None
+                    has_fresh_fix = False
                     if gps_data is None:
                         # Timeout or stop; fall back to last fix if we have one
                         if last_fix is None:
@@ -1371,8 +1544,10 @@ class CollectorThread(QtCore.QThread):
                         lat, lon = gps_data[0], gps_data[1]
                         num_sats = gps_data[2]
                         satellites = gps_data[3] if len(gps_data) > 3 else []
-                        if satellites is not None:
+                        if satellites:
                             last_satellites = satellites
+                        else:
+                            satellites = last_satellites
                         has_fix = lat is not None and lon is not None
                         if not has_fix:
                             self.status.emit("Waiting for GPS fix")
@@ -1381,14 +1556,19 @@ class CollectorThread(QtCore.QThread):
                             present_gps_loc = (lat, lon)
                             last_fix = present_gps_loc
                             last_fix_time = time.time()
+                            has_fresh_fix = True
                             if prev_fix is not None:
                                 current_bearing = _bearing_deg(prev_fix[0], prev_fix[1], lat, lon)
                             prev_fix = present_gps_loc
 
                     if present_gps_loc is not None:
-                        if num_sats is not None:
+                        if has_fresh_fix and num_sats is not None:
                             self.logger.info(
                                 f"Receiver position: ({present_gps_loc[0]}, {present_gps_loc[1]}) (GPS, sats={num_sats})"
+                            )
+                        elif has_fresh_fix:
+                            self.logger.info(
+                                f"Receiver position: ({present_gps_loc[0]}, {present_gps_loc[1]}) (GPS)"
                             )
                         else:
                             self.logger.info(
@@ -1398,6 +1578,7 @@ class CollectorThread(QtCore.QThread):
                         self.logger.info("Receiver position: (no GPS fix)")
 
                     fix_age = None if last_fix_time is None else max(0.0, time.time() - last_fix_time)
+                    gps_fix_valid = _gps_fix_is_current(present_gps_loc, last_fix_time)
                     antenna_states = []
                     strengths = []
                     qualities = []
@@ -1422,7 +1603,14 @@ class CollectorThread(QtCore.QThread):
                             )
                             continue
                         try:
-                            samples = funcs.readRadio(state["radio"], s["collection_time"], s["frequency"], s["gain"])
+                            configuration = (float(s["frequency"]), int(s["gain"]), SDR_DEFAULT_SAMPLE_RATE)
+                            samples = funcs.readRadio(
+                                state["radio"],
+                                s["collection_time"],
+                                s["frequency"],
+                                s["gain"],
+                                configure=state.get("configuration") != configuration,
+                            )
                             if samples is None or len(samples) == 0:
                                 raise Exception("No SDR samples")
                             processed = funcs.processSamples(samples)
@@ -1442,6 +1630,7 @@ class CollectorThread(QtCore.QThread):
                             state["snr"] = quality.get("snr", 0.0)
                             state["quality"] = quality.get("quality", 0.0)
                             state["sample_rate"] = getattr(state["radio"], "sample_rate", None)
+                            state["configuration"] = configuration
 
                             strengths.append(strength)
                             qualities.append(state["quality"])
@@ -1506,19 +1695,50 @@ class CollectorThread(QtCore.QThread):
                     self.logger.info(f"Estimated signal strength: {strength} / 1000")
                     self.logger.debug("Signal quality: %s", quality)
 
+                    movement_threshold_m = max(0.0, float(s.get("movement_threshold_m", 0.0) or 0.0))
+                    movement_distance_m = None
+                    cycle_paused = False
+                    pause_reason = None
+                    map_cycle_accepted = False
                     if present_gps_loc is not None and strength is not None:
+                        if last_mapped_fix is not None and movement_threshold_m > 0.0:
+                            movement_distance_m = _distance_m(
+                                last_mapped_fix[0],
+                                last_mapped_fix[1],
+                                present_gps_loc[0],
+                                present_gps_loc[1],
+                            )
+                            cycle_paused = (
+                                movement_distance_m is not None
+                                and movement_distance_m < movement_threshold_m
+                            )
+                        if cycle_paused:
+                            pause_reason = "Insufficient Movement, Paused Cycle"
+                            self.logger.info(
+                                "%s: position=(%.7f, %.7f), movement=%.2fm, threshold=%.2fm, strength=%s",
+                                pause_reason,
+                                present_gps_loc[0],
+                                present_gps_loc[1],
+                                movement_distance_m,
+                                movement_threshold_m,
+                                strength,
+                            )
+                        else:
+                            map_cycle_accepted = True
+                            last_mapped_fix = present_gps_loc
                         ts = time.time()
-                        history[present_gps_loc[0], present_gps_loc[1]] = {
-                            "strength": strength,
-                            "quality": quality.get("quality", 1.0),
-                            "snr": quality.get("snr", 0.0),
-                            "ts": ts,
-                        }
-                        _prune_history(history, ts)
+                        if map_cycle_accepted:
+                            history[present_gps_loc[0], present_gps_loc[1]] = {
+                                "strength": strength,
+                                "quality": quality.get("quality", 1.0),
+                                "snr": quality.get("snr", 0.0),
+                                "ts": ts,
+                            }
+                            _prune_history(history, ts)
                     # Update map using token from environment or settings override.
                     # If no token or network, a local offline map will be generated.
                     token = _get_mapbox_token()
-                    if history:
+                    if history and map_cycle_accepted:
                         now = time.time()
                         if now - last_map_update >= MAP_UPDATE_INTERVAL_S:
                             try:
@@ -1609,10 +1829,13 @@ class CollectorThread(QtCore.QThread):
 
                     target_relative = _relative_bearing(target_bearing, current_bearing)
 
+                    if self._gps_port_change_event.is_set():
+                        continue
+
                     actual_antenna_count = len(antenna_states) if antenna_states else antenna_count
                     self.telemetry.emit(
                         {
-                            "gps_fix": num_sats is not None and present_gps_loc is not None,
+                            "gps_fix": gps_fix_valid,
                             "gps_loc": present_gps_loc,
                             "sats": num_sats,
                             "fix_age_s": fix_age,
@@ -1635,6 +1858,11 @@ class CollectorThread(QtCore.QThread):
                             "map_confidence": map_confidence,
                             "fusion_confidence": fusion_confidence,
                             "bearing_source": bearing_source,
+                            "cycle_paused": cycle_paused,
+                            "pause_reason": pause_reason,
+                            "movement_distance_m": movement_distance_m,
+                            "movement_threshold_m": movement_threshold_m,
+                            "map_cycle_accepted": map_cycle_accepted,
                         }
                     )
                     self.status.emit("Collecting")

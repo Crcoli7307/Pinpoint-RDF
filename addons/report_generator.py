@@ -320,6 +320,8 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
             strengths = []
             snrs = []
             gps_fix = []
+            paused_samples = 0
+            pause_reason = None
             for fr in frames:
                 tele = fr.get("telemetry") or {}
                 if tele.get("strength") is not None:
@@ -328,6 +330,14 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
                     snrs.append(float(tele.get("snr")))
                 if tele.get("gps_fix") is not None:
                     gps_fix.append(bool(tele.get("gps_fix")))
+                if tele.get("cycle_paused"):
+                    paused_samples += 1
+                    pause_reason = tele.get("pause_reason") or "Insufficient Movement, Paused Cycle"
+            cycle_status = "Mapped"
+            if paused_samples:
+                cycle_status = pause_reason
+                if paused_samples != len(frames):
+                    cycle_status += f" ({paused_samples}/{len(frames)} samples)"
             output.append(
                 {
                     "index": idx + 1,
@@ -337,6 +347,8 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
                     "snr_avg": _avg(snrs),
                     "gps_fix_rate": (_avg([1.0 if f else 0.0 for f in gps_fix]) if gps_fix else None),
                     "samples": len(frames),
+                    "paused_samples": paused_samples,
+                    "status": cycle_status,
                 }
             )
         self._cycles_cache_key = cache_key
@@ -647,6 +659,7 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
                     f"<td>{_fmt_num(c['strength_avg'], 1)}</td>"
                     f"<td>{_fmt_num(c['snr_avg'], 2)}</td>"
                     f"<td>{_fmt_num((c['gps_fix_rate'] or 0) * 100.0, 1)}%</td>"
+                    f"<td>{c['status']}</td>"
                     "</tr>"
                 )
             if not cycle_rows_list:
@@ -655,8 +668,8 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
                   <h2 class='section-title'>Cycle Summary</h2>
                   <div class='section-body'>
                     <table>
-                      <tr><th>Cycle</th><th>Window</th><th>Samples</th><th>Avg Strength</th><th>Avg SNR</th><th>GPS Fix %</th></tr>
-                      <tr><td colspan='6'>No cycle data available.</td></tr>
+                      <tr><th>Cycle</th><th>Window</th><th>Samples</th><th>Avg Strength</th><th>Avg SNR</th><th>GPS Fix %</th><th>Status</th></tr>
+                      <tr><td colspan='7'>No cycle data available.</td></tr>
                     </table>
                   </div>
                 </div>
@@ -674,7 +687,7 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
                           <h2 class='section-title'>{title}</h2>
                           <div class='section-body'>
                             <table>
-                              <tr><th>Cycle</th><th>Window</th><th>Samples</th><th>Avg Strength</th><th>Avg SNR</th><th>GPS Fix %</th></tr>
+                              <tr><th>Cycle</th><th>Window</th><th>Samples</th><th>Avg Strength</th><th>Avg SNR</th><th>GPS Fix %</th><th>Status</th></tr>
                               {''.join(chunk)}
                             </table>
                           </div>

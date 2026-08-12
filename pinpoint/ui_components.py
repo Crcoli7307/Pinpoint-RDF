@@ -31,6 +31,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.spacing_input = QtWidgets.QLineEdit()
         self.spacing_mode = QtWidgets.QComboBox()
         self.refresh_input = QtWidgets.QLineEdit()
+        self.movement_threshold_input = QtWidgets.QLineEdit()
         self.profile_input = QtWidgets.QLineEdit()
         self.aoa_weight_input = QtWidgets.QLineEdit()
         self.map_weight_input = QtWidgets.QLineEdit()
@@ -45,6 +46,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.antenna_input.setValidator(QtGui.QIntValidator(1, 16))
         self.spacing_input.setValidator(QtGui.QDoubleValidator(0.0, 1000.0, 2))
         self.refresh_input.setValidator(QtGui.QIntValidator(1, 60))
+        self.movement_threshold_input.setValidator(QtGui.QDoubleValidator(0.0, 100000.0, 2))
         self.aoa_weight_input.setValidator(QtGui.QDoubleValidator(0.0, 1.0, 2))
         self.map_weight_input.setValidator(QtGui.QDoubleValidator(0.0, 1.0, 2))
         self.conf_threshold_input.setValidator(QtGui.QDoubleValidator(0.0, 1.0, 2))
@@ -56,6 +58,7 @@ class SettingsDialog(QtWidgets.QDialog):
             self.antenna_input.setText(str(settings.antenna_count))
             self.spacing_input.setText("" if not settings.antenna_spacing_in else str(settings.antenna_spacing_in))
             self.refresh_input.setText(str(settings.info_refresh_s))
+            self.movement_threshold_input.setText(str(settings.movement_threshold_m))
             self.profile_input.setText(str(settings.calibration_profile))
             self.aoa_weight_input.setText(str(settings.fusion_aoa_weight))
             self.map_weight_input.setText(str(settings.fusion_map_weight))
@@ -86,6 +89,7 @@ class SettingsDialog(QtWidgets.QDialog):
         form.addRow("Antenna Spacing Mode", self.spacing_mode)
         form.addRow("Antenna Spacing (in)", self.spacing_input)
         form.addRow("Info Refresh (s)", self.refresh_input)
+        form.addRow("Map Movement Threshold (m, 0=off)", self.movement_threshold_input)
         form.addRow("Calibration Profile", self.profile_input)
         form.addRow("Fusion Weight (AoA)", self.aoa_weight_input)
         form.addRow("Fusion Weight (Map)", self.map_weight_input)
@@ -117,6 +121,7 @@ class SettingsDialog(QtWidgets.QDialog):
             antenna_count = int(self.antenna_input.text())
             spacing_in = self._resolve_spacing_in(freq)
             refresh_s = int(self.refresh_input.text())
+            movement_threshold_m = float(self.movement_threshold_input.text())
             profile = self.profile_input.text().strip() or "default"
             aoa_weight = float(self.aoa_weight_input.text())
             map_weight = float(self.map_weight_input.text())
@@ -129,6 +134,7 @@ class SettingsDialog(QtWidgets.QDialog):
                 settings.antenna_count = antenna_count
                 settings.antenna_spacing_in = max(0.0, spacing_in)
                 settings.info_refresh_s = refresh_s
+                settings.movement_threshold_m = max(0.0, movement_threshold_m)
                 settings.calibration_profile = profile
                 settings.fusion_aoa_weight = aoa_weight
                 settings.fusion_map_weight = map_weight
@@ -405,16 +411,28 @@ class GPSInfoDialog(QtWidgets.QDialog):
 
     def refresh(self):
         try:
-            satellites = self._get_satellites() if callable(self._get_satellites) else []
+            satellite_info = self._get_satellites() if callable(self._get_satellites) else []
         except Exception:
-            satellites = []
-        self._set_satellites(satellites)
+            satellite_info = []
+        if isinstance(satellite_info, dict):
+            satellites = satellite_info.get("satellites") or []
+            satellite_count = satellite_info.get("count")
+        else:
+            satellites = satellite_info or []
+            satellite_count = None
+        self._set_satellites(satellites, satellite_count)
         self._timer.setInterval(self._refresh_interval_ms())
 
-    def _set_satellites(self, satellites):
+    def _set_satellites(self, satellites, satellite_count=None):
         sats = satellites or []
         self.table.setRowCount(len(sats))
         self.empty_label.setVisible(len(sats) == 0)
+        if not sats and satellite_count is not None:
+            self.empty_label.setText(
+                f"{satellite_count} satellites used; waiting for detailed GSV data..."
+            )
+        elif not sats:
+            self.empty_label.setText("Waiting for satellites...")
         for row, sat in enumerate(sats):
             prn = str(sat.get("prn", ""))
             snr = sat.get("snr")
@@ -1050,8 +1068,9 @@ class GPSSetupWizard(QtWidgets.QDialog):
     Simple GPS port selection wizard for field operators.
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, current_port: Optional[str] = None):
         super().__init__(parent)
+        self._current_port = current_port
         _apply_app_icon(self)
         self.setWindowTitle("GPS Configuration")
         self.setMinimumWidth(520)
@@ -1090,6 +1109,12 @@ class GPSSetupWizard(QtWidgets.QDialog):
         for p in self._ports:
             label = f"{p['device']} - {p['description']}".strip(" -")
             self.port_combo.addItem(label, p)
+        if self._current_port:
+            for index in range(self.port_combo.count()):
+                data = self.port_combo.itemData(index)
+                if isinstance(data, dict) and (data.get("device") or "").upper() == self._current_port.upper():
+                    self.port_combo.setCurrentIndex(index)
+                    break
         self._update_desc()
 
     def _update_desc(self):
@@ -1485,6 +1510,7 @@ class GPSProbeThread(QtCore.QThread):
 
 class GPSFixWaitThread(QtCore.QThread):
     fix_acquired = QtCore.pyqtSignal()
+    connected_without_fix = QtCore.pyqtSignal()
     error = QtCore.pyqtSignal(object)
 
     def __init__(self, port: str, parent=None):
@@ -1500,14 +1526,16 @@ class GPSFixWaitThread(QtCore.QThread):
                 logger,
                 serial_port=gps_serial,
                 nmea_reader=gps_reader,
-                max_wait_s=None,
+                max_wait_s=GPS_MAX_WAIT_S,
             )
             if result is not None:
                 lat, lon = result[0], result[1]
                 if lat is not None and lon is not None:
                     self.fix_acquired.emit()
                     return
-            self.error.emit(Exception("No GPS fix received."))
+                self.connected_without_fix.emit()
+                return
+            self.error.emit(Exception("No NMEA data received from the selected port."))
         except Exception as e:
             self.error.emit(e)
         finally:
@@ -1544,7 +1572,7 @@ class HardwareCheckThread(QtCore.QThread):
 
 class GPSStartupDialog(QtWidgets.QDialog):
     """
-    Splash-style GPS initialization dialog with progress and prompts.
+    GPS and SDR initialization dialog with progress and prompts.
     """
 
     def __init__(self, timeout_s: float = 8.0, parent=None):
@@ -1709,7 +1737,7 @@ class GPSStartupDialog(QtWidgets.QDialog):
             port = wizard.selected_port()
             if port:
                 self._selected_port = port
-                self.accept()
+                QtCore.QTimer.singleShot(0, self._start_fix_wait)
                 return
         # If user cancels, keep app running but without a selected GPS port.
         self.reject()
@@ -1726,8 +1754,14 @@ class GPSStartupDialog(QtWidgets.QDialog):
         self._probe_thread.found.connect(self._on_probe_found)
         self._probe_thread.not_found.connect(self._on_probe_not_found)
         self._probe_thread.error.connect(self._on_probe_error)
-        self._probe_thread.finished.connect(self._probe_thread.deleteLater)
+        self._probe_thread.finished.connect(self._on_probe_finished)
         self._probe_thread.start()
+
+    def _on_probe_finished(self) -> None:
+        thread = self._probe_thread
+        self._probe_thread = None
+        if thread is not None:
+            thread.deleteLater()
 
     def _on_probe_found(self, port: str) -> None:
         self._set_status(f"Found GPS on Port: {port}", mode="gps")
@@ -1752,19 +1786,32 @@ class GPSStartupDialog(QtWidgets.QDialog):
         self.progress.setValue(max(85, self.progress.value()))
         self._fix_thread = GPSFixWaitThread(self._selected_port, self)
         self._fix_thread.fix_acquired.connect(self._on_fix_acquired)
+        self._fix_thread.connected_without_fix.connect(self._on_connected_without_fix)
         self._fix_thread.error.connect(self._on_fix_error)
-        self._fix_thread.finished.connect(self._fix_thread.deleteLater)
+        self._fix_thread.finished.connect(self._on_fix_wait_finished)
         self._fix_thread.start()
+
+    def _on_fix_wait_finished(self) -> None:
+        thread = self._fix_thread
+        self._fix_thread = None
+        if thread is not None:
+            thread.deleteLater()
 
     def _on_fix_acquired(self) -> None:
         self._set_status("Signal acquired!", mode="gps")
         self.progress.setValue(100)
         QtCore.QTimer.singleShot(1000, self.accept)
 
+    def _on_connected_without_fix(self) -> None:
+        self._set_status("GPS connected; waiting for satellite fix in the main window.", mode="gps")
+        self.progress.setValue(100)
+        QtCore.QTimer.singleShot(1000, self.accept)
+
     def _on_fix_error(self, error: Exception) -> None:
         self._last_error = error
-        self._set_status("Acquiring GPS Signal...", mode="gps")
-        QtCore.QTimer.singleShot(1000, self._start_fix_wait)
+        self._selected_port = None
+        self._set_status("No GPS data received. Choose the GPS port manually.", mode="gps")
+        QtCore.QTimer.singleShot(500, self._open_wizard)
 
     def selected_port(self) -> Optional[str]:
         return self._selected_port
