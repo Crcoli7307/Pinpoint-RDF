@@ -8,7 +8,7 @@ Provides mapping helpers to predict transmitter location and render static maps.
 Supports offline rendering and Mapbox-backed map generation.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """
 
 import logging

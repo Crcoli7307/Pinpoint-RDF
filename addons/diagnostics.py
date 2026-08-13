@@ -8,7 +8,7 @@ Implements the Diagnostics add-on dialog with system, settings, and device check
 Wires the menu action used to open the dialog.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """
 from __future__ import annotations
 

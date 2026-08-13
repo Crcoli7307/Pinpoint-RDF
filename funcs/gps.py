@@ -8,7 +8,7 @@ Detects GPS serial ports, probes for NMEA output, and reads fixes and satellite 
 Exposes helper functions for UI selection and continuous reads.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """
 
 import os

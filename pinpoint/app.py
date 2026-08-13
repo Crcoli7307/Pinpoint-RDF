@@ -8,7 +8,7 @@ Bootstraps the Qt application and applies high-DPI settings.
 Presents the startup dialog and creates the main window based on user choices.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """
 import multiprocessing
 import os

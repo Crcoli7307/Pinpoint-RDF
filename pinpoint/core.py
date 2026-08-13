@@ -8,7 +8,7 @@ Holds core configuration, shared state, and utility functions for Pinpoint.
 Provides settings, logging, resource paths, and hardware/data helpers used across the app.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """
 
 import os

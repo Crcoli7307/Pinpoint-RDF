@@ -8,7 +8,7 @@ Provides the top-level entry point for the Pinpoint application.
 Delegates to pinpoint.app.main() when run as a script.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """
 from pinpoint.app import main
 

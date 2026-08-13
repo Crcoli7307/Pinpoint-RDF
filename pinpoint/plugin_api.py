@@ -8,7 +8,7 @@ Defines the add-on API, including plugin metadata and menu action models.
 Implements a lightweight handler registry and event bus for add-ons.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """
 from __future__ import annotations
 

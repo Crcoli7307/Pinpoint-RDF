@@ -8,7 +8,7 @@ Implements the Report Generator add-on for building mission reports.
 Provides a multi-tab UI and helpers for stats, maps, and PDF export.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """
 
 from __future__ import annotations

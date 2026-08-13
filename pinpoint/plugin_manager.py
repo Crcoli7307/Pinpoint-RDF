@@ -8,7 +8,7 @@ Discovers and loads add-on plugins from the addons directory.
 Builds and refreshes add-on menus, tracks changes, and supports reloads.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """
 from __future__ import annotations
 

@@ -8,7 +8,7 @@ Provides a demo add-on that simulates GPS and SDR telemetry for the UI.
 Includes a settings dialog to tune demo path, signal, and timing parameters.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """
 from __future__ import annotations
 

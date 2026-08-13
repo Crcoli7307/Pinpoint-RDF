@@ -8,7 +8,7 @@ Defines reusable dialogs, widgets, and worker threads used by the UI.
 Centralizes shared UI helpers such as settings, startup, and info panels.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """
 from .core import *  # noqa: F401,F403
 

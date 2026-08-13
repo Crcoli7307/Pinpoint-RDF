@@ -8,7 +8,7 @@ Implements the History Exporter add-on for saving collected points.
 Provides CSV and GeoJSON export flows with a small dialog.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """
 
 from __future__ import annotations

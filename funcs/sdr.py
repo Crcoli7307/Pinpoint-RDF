@@ -8,7 +8,7 @@ Wraps SDR device access and signal processing helpers.
 Includes sampling, strength/quality calculations, and device discovery.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """
 
 import numpy as np

@@ -8,7 +8,7 @@ Defines pytest coverage for SDR, GPS, map rendering, and plugin API behavior.
 Includes stubs and fixtures so tests run without hardware or optional dependencies.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """
 
 import importlib

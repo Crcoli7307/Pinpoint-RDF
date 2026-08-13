@@ -8,7 +8,7 @@ Aggregates SDR, GPS, and map helpers into a single import surface.
 Re-exports commonly used third-party modules for convenience.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """
 
 from .sdr import (

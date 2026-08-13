@@ -8,7 +8,7 @@ Implements the Meshtastic connectivity add-on with connection, handshake, and st
 Provides UI wiring and helpers for linking nodes and displaying messages.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """
 
 

@@ -8,5 +8,5 @@ Defines the Pinpoint package namespace used by imports.
 Keeps package-level initialization minimal to avoid side effects.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """

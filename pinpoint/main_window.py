@@ -8,7 +8,7 @@ Implements the primary Qt window, including map display, status panels, and cont
 Coordinates data collection, playback, and add-on integration.
 ---
 
-https://nexus.crayton.dev/
+https://crayton.dev/
 """
 from .core import *  # noqa: F401,F403
 from .ui_components import *  # noqa: F401,F403
