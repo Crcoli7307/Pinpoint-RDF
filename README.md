@@ -60,6 +60,12 @@ The map movement threshold is specified in meters. With adaptive movement enable
 
 The map occupies the right side of the main workspace. The left side remains blank until a current or historical fix is selected. Clicking an interactive marker—or a marker in the static-map fallback—opens that cycle's full telemetry snapshot, including GPS data, signal/SNR, per-antenna health and measurements, movement gating, acquisition timing, bearing/fusion results, and the configured and effective calculation parameters. New recordings preserve those calculation parameters with every cycle.
 
+Playback rebuilds the map from the GPS fixes stored in the recording as the timeline advances or is scrubbed. It uses the interactive map when Mapbox and Qt WebEngine are available, and otherwise renders a local static map; embedded maps remain a fallback for older recordings without usable GPS telemetry.
+
+New playback files store the visible, post-debounce field alerts with every telemetry frame. Replay displays those recorded error, warning, informational, and debug banners at the same points in the timeline, including on locally rendered static maps. Older playback files remain compatible but have no historical alert snapshots. The Live SDR Waterfall is disabled during playback because recordings do not contain the original SDR sample stream.
+
+The Report Generator produces a formal mission record with an executive overview, operator purpose and remarks, configuration disclosure, automated mission narrative, sensor/data-quality findings, signal and antenna statistics, recorded field-alert summary, mission map, and cycle-by-cycle appendix. The appendix is one continuous table: headers repeat automatically and complete cycle rows move together across PDF page boundaries. Reports prefer the visible interactive map and can reconstruct a mission plot from accepted recorded fixes when no usable image was embedded.
+
 **Alerts**
 
 System alerts debounce transient readings and automatically disappear when their underlying condition resolves. Error, warning, informational, and debug notices render red, yellow, green, and blue respectively.

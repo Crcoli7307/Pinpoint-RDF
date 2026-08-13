@@ -19,7 +19,7 @@ from urllib.parse import quote
 
 import numpy as np
 import requests
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 def predictTransmitterLocation(history, logger):
     """
@@ -121,7 +121,58 @@ def estimateTransmitterLocation(history, logger):
         "method": "signal-weighted centroid",
     }
 
-def _render_offline_map(history, output_file="map.png", size=(800, 500)):
+def _alert_font(size=26):
+    try:
+        return ImageFont.truetype("arialbd.ttf", size)
+    except OSError:
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:
+            return ImageFont.load_default()
+
+
+def _draw_alert_overlay(img, alerts):
+    if not alerts:
+        return
+    draw = ImageDraw.Draw(img, "RGBA")
+    severity_colors = {
+        "error": (255, 31, 31, 255),
+        "warning": (255, 176, 0, 255),
+        "info": (34, 197, 94, 255),
+        "debug": (56, 189, 248, 255),
+    }
+    font = _alert_font()
+    y = 18
+    for alert in alerts:
+        if not isinstance(alert, dict) or not alert.get("message"):
+            continue
+        message = str(alert["message"])
+        color = severity_colors.get(str(alert.get("severity") or "warning").lower(), severity_colors["warning"])
+        bbox = draw.textbbox((0, 0), message, font=font, stroke_width=1)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        left = max(8, int((img.width - text_width) / 2) - 18)
+        right = min(img.width - 8, left + text_width + 36)
+        bottom = y + text_height + 20
+        draw.rounded_rectangle(
+            (left, y, right, bottom),
+            radius=8,
+            fill=(20, 20, 20, 225),
+            outline=color,
+            width=3,
+        )
+        draw.text(
+            ((img.width - text_width) / 2, y + 8 - bbox[1]),
+            message,
+            font=font,
+            fill=color,
+            stroke_width=1,
+            stroke_fill=(20, 20, 20, 255),
+        )
+        y = bottom + 8
+
+
+def _render_offline_map(history, output_file="map.png", size=(800, 500), alerts=None):
     if not history:
         return
     width, height = size
@@ -220,7 +271,28 @@ def _render_offline_map(history, output_file="map.png", size=(800, 500)):
         width=1,
     )
     draw.text((margin, 6), "Offline Map", fill="#374151")
-    img.save(output_file)
+    _draw_alert_overlay(img, alerts)
+    img.save(output_file, format="PNG")
+
+
+def renderOfflineMapBytes(history, size=(800, 500), alerts=None):
+    """Render a self-contained offline map and return PNG bytes."""
+    if not history:
+        return None
+    output = BytesIO()
+    _render_offline_map(history, output_file=output, size=size, alerts=alerts)
+    return output.getvalue()
+
+
+def overlayAlertsOnMapBytes(png_bytes, alerts):
+    """Draw recorded alert banners on an existing map image."""
+    if not png_bytes or not alerts:
+        return png_bytes
+    image = Image.open(BytesIO(png_bytes)).convert("RGB")
+    _draw_alert_overlay(image, alerts)
+    output = BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
 
 def mapFunction(history, access_token, logger, output_file="map.png", max_markers=None, max_url_len=None):
     """

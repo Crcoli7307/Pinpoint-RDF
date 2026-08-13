@@ -32,6 +32,8 @@ from .gps import (
 from .map import (
     predictTransmitterLocation,
     estimateTransmitterLocation,
+    renderOfflineMapBytes,
+    overlayAlertsOnMapBytes,
     mapFunction,
 )
 
@@ -53,6 +55,8 @@ __all__ = [
     'list_sdr_devices',
     'predictTransmitterLocation',
     'estimateTransmitterLocation',
+    'renderOfflineMapBytes',
+    'overlayAlertsOnMapBytes',
     'mapFunction',
     '_probe_nmea',
     '_find_gps_port',

@@ -173,29 +173,50 @@ class WaterfallWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self.setMinimumSize(760, 420)
         self._rows = []
+        self._pending_row = None
         self._scroll_offset = 0.0
+        self._scroll_step = 0.22
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._animate)
         self._timer.start()
 
+    def clear(self):
+        self._rows = []
+        self._pending_row = None
+        self._scroll_offset = 0.0
+        self.update()
+
     def add_spectrum(self, values):
         if not values:
             return
-        self._rows.append([float(v) for v in values])
-        self._rows = self._rows[-240:]
-        self._scroll_offset = 0.0
+        row = [float(v) for v in values]
+        if not self._rows:
+            self._rows.append(row)
+        else:
+            # Commit new data on a row boundary. Appending it immediately would
+            # move the entire history by a full row in the middle of a smooth
+            # scroll and make the display visibly jump.
+            self._pending_row = row
         self.update()
 
     def _animate(self):
         if self._rows:
             row_height = max(2.0, self.height() / 120.0)
-            self._scroll_offset += 0.22
-            if self._scroll_offset >= row_height:
-                self._rows.append(list(self._rows[-1]))
+            self._scroll_offset += self._scroll_step
+            while self._scroll_offset >= row_height:
+                self._scroll_offset -= row_height
+                next_row = self._pending_row
+                if next_row is None:
+                    next_row = list(self._rows[-1])
+                self._rows.append(next_row)
                 self._rows = self._rows[-240:]
-                self._scroll_offset = 0.0
+                self._pending_row = None
             self.update()
+
+    def _row_y(self, index_from_newest, row_height):
+        """Return a row's top edge while the history scrolls upward."""
+        return self.height() - row_height - self._scroll_offset - (index_from_newest * row_height)
 
     @staticmethod
     def _color(value, minimum, maximum):
@@ -220,8 +241,8 @@ class WaterfallWidget(QtWidgets.QWidget):
         values = [value for row in self._rows for value in row]
         minimum, maximum = min(values), max(values)
         row_height = max(2.0, self.height() / 120.0)
-        y = self.height() - row_height + self._scroll_offset
-        for row in reversed(self._rows):
+        for index, row in enumerate(reversed(self._rows)):
+            y = self._row_y(index, row_height)
             if y < 0:
                 break
             cell_width = self.width() / max(1, len(row))
@@ -238,6 +259,7 @@ class LiveWaterfallDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self._api = api
         self._latest = {}
+        self._rendered_device = None
         self.setWindowTitle("Live SDR Waterfall")
         self.setMinimumSize(860, 580)
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -284,6 +306,9 @@ class LiveWaterfallDialog(QtWidgets.QDialog):
         state = next((item for item in states if item.get("index") == selected), None)
         if not state:
             return
+        if selected != self._rendered_device:
+            self.canvas.clear()
+            self._rendered_device = selected
         spectrum = state.get("spectrum_db") or []
         self.canvas.add_spectrum(spectrum)
         strength = state.get("strength")
@@ -309,9 +334,26 @@ def _open_diagnostics(api: PinpointAPI) -> None:
 
 
 def _open_waterfall(api: PinpointAPI) -> None:
+    if not _waterfall_enabled(api):
+        api.call(
+            "ui.show_message",
+            {
+                "title": "Live SDR Waterfall",
+                "message": "The live waterfall is unavailable during recording playback because raw SDR samples are not stored in playback files.",
+                "level": "info",
+            },
+        )
+        return
     parent = api.call("ui.get_main_window").get("window")
     dlg = LiveWaterfallDialog(api, parent=parent)
     dlg.exec()
+
+
+def _waterfall_enabled(api: PinpointAPI) -> bool:
+    window = api.call("ui.get_main_window").get("window")
+    if window is None:
+        return False
+    return not bool(getattr(window, "playback_mode", False) or getattr(window, "playback_only", False))
 
 
 def plugin_entry(api: PinpointAPI) -> AddonPlugin:
@@ -330,6 +372,8 @@ def plugin_entry(api: PinpointAPI) -> AddonPlugin:
                 id="diagnostics_waterfall",
                 label="Live SDR Waterfall...",
                 handler=_open_waterfall,
+                enabled=_waterfall_enabled,
+                tooltip="Available only outside recording playback.",
             ),
         ],
     )

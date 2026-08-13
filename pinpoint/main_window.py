@@ -357,6 +357,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_start_wall = 0.0
         self._playback_start_t = 0.0
         self._playback_last_map_bytes: Optional[bytes] = None
+        self._playback_render_cache: dict[int, bytes] = {}
+        self.playback_alerts: list[dict] = []
         self._playback_slider_dragging = False
         self._gps_info_dialog: Optional[GPSInfoDialog] = None
         self._antenna_info_dialog: Optional[AntennaInfoDialog] = None
@@ -1518,6 +1520,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 },
                 "telemetry": dict(tele),
             }
+            recorded_alerts = MainWindow._normalize_recorded_alerts(frame.get("alerts"))
+            if recorded_alerts:
+                details[point_id]["field_alerts"] = recorded_alerts
         if self._idle_gps_point and not self.collecting and not self.playback_mode:
             point = dict(self._idle_gps_point)
             point_id = "idle-current"
@@ -1693,12 +1698,14 @@ class MainWindow(QtWidgets.QMainWindow):
             s = settings.to_dict()
         if self.report_header and isinstance(self.report_header.get("settings"), dict):
             s = self.report_header.get("settings") or s
-        map_png_b64 = None
-        # Prefer last embedded map from playback if available
-        for frame in reversed(self.report_cache_frames):
-            if frame.get("map_png"):
-                map_png_b64 = frame.get("map_png")
-                break
+        map_png_b64 = self._capture_report_map_png_b64()
+        # Recordings can supply an embedded map when no live interactive view
+        # is available (for example, in playback-only mode).
+        if not map_png_b64:
+            for frame in reversed(self.report_cache_frames):
+                if frame.get("map_png"):
+                    map_png_b64 = frame.get("map_png")
+                    break
         start_time = None
         if self.report_header and self.report_header.get("created_utc"):
             start_time = self.report_header.get("created_utc")
@@ -1715,6 +1722,28 @@ class MainWindow(QtWidgets.QMainWindow):
             "start_time": start_time,
         }
 
+    def _capture_report_map_png_b64(self) -> Optional[str]:
+        """Capture the map currently visible to the operator for the report."""
+        if not (
+            getattr(self, "_interactive_map_enabled", False)
+            and getattr(self, "_map_ready", False)
+            and getattr(self, "map_view", None) is not None
+        ):
+            return None
+        try:
+            pixmap = self.map_view.grab()
+            if pixmap.isNull():
+                return None
+            buffer = QtCore.QBuffer()
+            if not buffer.open(QtCore.QIODevice.OpenModeFlag.WriteOnly):
+                return None
+            if not pixmap.save(buffer, "PNG"):
+                return None
+            return base64.b64encode(bytes(buffer.data())).decode("ascii")
+        except Exception:
+            logger.exception("Could not capture the interactive map for the report.")
+            return None
+
     # ---------- Playback ----------
     def _enter_playback(self, frames: list[dict], header: Optional[dict] = None, flags: Optional[list[dict]] = None):
         self.playback_mode = True
@@ -1727,6 +1756,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.playback_speed_factor = 1.0
         self._playback_playing = False
         self._playback_last_map_bytes = None
+        self._playback_render_cache = {}
+        self.playback_alerts = []
         self.playback_slider.setMinimum(0)
         self.playback_slider.setMaximum(max(0, len(frames) - 1))
         self.playback_slider.setValue(0)
@@ -1743,11 +1774,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "exit_playback_action"):
             self.exit_playback_action.setEnabled(True)
         self.image_timer.stop()
+        self._refresh_map_mode(force=True)
         self._apply_playback_frame(0)
         self._update_playback_time_label()
         self._update_info_panel()
         self._refresh_report_action()
-        self._refresh_map_mode(force=True)
         if hasattr(self, "api") and self.api:
             self.api.emit("playback.started", {"ts": time.time(), "frames": len(frames)})
 
@@ -1770,6 +1801,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "exit_playback_action"):
             self.exit_playback_action.setEnabled(False)
         self._playback_last_map_bytes = None
+        self._playback_render_cache = {}
+        self.playback_alerts = []
         self.playback_slider.set_flags([], 0.0)
         self.update_image(force=True)
         self.image_timer.start()
@@ -1828,18 +1861,84 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_playback_frame(self, idx: int):
         frame = self.playback_frames[idx]
-        if "map_png" in frame and frame["map_png"]:
-            try:
-                png_bytes = base64.b64decode(frame["map_png"])
-                self._playback_last_map_bytes = png_bytes
-                self._set_map_image_bytes(png_bytes)
-            except Exception:
-                pass
-        elif self._playback_last_map_bytes:
-            self._set_map_image_bytes(self._playback_last_map_bytes)
+        self.playback_alerts = self._normalize_recorded_alerts(frame.get("alerts"))
         telemetry = frame.get("telemetry") or {}
         self._apply_telemetry(telemetry)
+        if self._interactive_map_enabled and self.map_view is not None:
+            self._update_interactive_map(force=True)
+        else:
+            self._show_playback_static_map(idx)
         self._refresh_info_dialogs()
+
+    def _show_playback_static_map(self, idx: int) -> None:
+        png_bytes = self._render_playback_map(idx)
+        if png_bytes:
+            self._playback_last_map_bytes = png_bytes
+            self._set_map_image_bytes(png_bytes)
+            return
+        self.image_label.clear()
+        self.image_label.setText("No GPS map data in this recording frame.")
+
+    def _playback_history_at(self, idx: int) -> dict:
+        history = {}
+        frames = self.playback_frames[: max(0, idx) + 1]
+        for frame_index, frame in enumerate(frames):
+            telemetry = frame.get("telemetry") or {}
+            if telemetry.get("cycle_paused"):
+                continue
+            gps_loc = telemetry.get("gps_loc")
+            if not gps_loc:
+                continue
+            try:
+                lat, lon = float(gps_loc[0]), float(gps_loc[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            history[(lat, lon)] = {
+                "strength": telemetry.get("strength") or 0,
+                "quality": telemetry.get("quality") if telemetry.get("quality") is not None else 1.0,
+                "snr": telemetry.get("snr"),
+                "ts": telemetry.get("measurement_ts", frame.get("t", frame_index)),
+            }
+        if HISTORY_MAX_POINTS and len(history) > HISTORY_MAX_POINTS:
+            items = sorted(history.items(), key=lambda item: item[1].get("ts") or 0)
+            history = dict(items[-HISTORY_MAX_POINTS:])
+        return history
+
+    def _embedded_playback_map_at(self, idx: int) -> Optional[bytes]:
+        for frame in reversed(self.playback_frames[: max(0, idx) + 1]):
+            encoded = frame.get("map_png")
+            if not encoded:
+                continue
+            try:
+                return base64.b64decode(encoded, validate=True)
+            except (ValueError, TypeError, base64.binascii.Error):
+                continue
+        return None
+
+    def _render_playback_map(self, idx: int) -> Optional[bytes]:
+        cached = self._playback_render_cache.get(idx)
+        if cached:
+            return cached
+        history = self._playback_history_at(idx)
+        playback_alerts = list(getattr(self, "playback_alerts", []) or [])
+        png_bytes = None
+        if history:
+            try:
+                png_bytes = funcs.renderOfflineMapBytes(history, alerts=playback_alerts)
+            except Exception:
+                logger.exception("Could not reconstruct playback map from recorded GPS fixes.")
+        if not png_bytes:
+            png_bytes = self._embedded_playback_map_at(idx)
+            if png_bytes and playback_alerts:
+                try:
+                    png_bytes = funcs.overlayAlertsOnMapBytes(png_bytes, playback_alerts)
+                except Exception:
+                    logger.exception("Could not overlay recorded alerts on the embedded playback map.")
+        if png_bytes:
+            self._playback_render_cache[idx] = png_bytes
+            while len(self._playback_render_cache) > 12:
+                self._playback_render_cache.pop(next(iter(self._playback_render_cache)))
+        return png_bytes
 
     def _set_playback_index(self, idx: int):
         self.playback_index = max(0, min(idx, len(self.playback_frames) - 1))
@@ -2164,17 +2263,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.api.emit("collection.stopped", {"ts": time.time()})
 
     def _on_telemetry(self, data: dict):
+        if self.playback_mode:
+            return
+        self._apply_telemetry(data)
+        field_alerts = self._get_map_notifications()
         if self.recording_session is not None:
             try:
-                self.recording_session.record_frame(data)
+                self.recording_session.record_frame(data, alerts=field_alerts)
             except Exception as e:
                 logger.error("Failed to record frame: %s", e)
         self._cache_report_frame(data)
         if hasattr(self, "api") and self.api:
             self.api.emit("telemetry", data)
-        if self.playback_mode:
-            return
-        self._apply_telemetry(data)
 
     def _apply_telemetry(self, data: dict):
         self.latest_telemetry = dict(data)
@@ -2361,7 +2461,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def update_image(self, force: bool = False):
         try:
-            if self._interactive_map_enabled and not self.playback_mode:
+            if self._interactive_map_enabled:
                 self._update_interactive_map(force=force)
                 return
             if not os.path.exists(IMAGE_PATH):
@@ -2389,7 +2489,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_map_mode(self, force: bool = False) -> None:
         token = _get_mapbox_token()
-        should_enable = bool(self.map_view and token) and not self.playback_mode
+        should_enable = bool(self.map_view and token)
         if should_enable and (force or not self._interactive_map_enabled):
             self._enable_interactive_map()
         elif not should_enable and (force or self._interactive_map_enabled):
@@ -2414,7 +2514,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_map_load_finished(self, ok: bool) -> None:
         self._map_ready = bool(ok)
-        if not ok or not self._interactive_map_enabled or not self.map_view:
+        if not ok:
+            if self.playback_mode and self.playback_frames:
+                self._disable_interactive_map()
+                self._show_playback_static_map(self.playback_index)
+            return
+        if not self._interactive_map_enabled or not self.map_view:
             return
         if self._pending_map_points is None:
             return
@@ -2494,9 +2599,31 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _get_map_notifications(self) -> list[dict]:
+        if getattr(self, "playback_mode", False):
+            return list(getattr(self, "playback_alerts", []) or [])
         if not hasattr(self, "alert_manager"):
             return []
         return self.alert_manager.snapshot()
+
+    @staticmethod
+    def _normalize_recorded_alerts(alerts: object) -> list[dict]:
+        if not isinstance(alerts, list):
+            return []
+        normalized = []
+        for index, alert in enumerate(alerts):
+            if not isinstance(alert, dict) or not alert.get("message"):
+                continue
+            severity = str(alert.get("severity") or "warning").lower()
+            if severity not in {"error", "warning", "info", "debug"}:
+                severity = "warning"
+            normalized.append(
+                {
+                    "key": str(alert.get("key") or f"recorded-alert-{index}"),
+                    "message": str(alert["message"]),
+                    "severity": severity,
+                }
+            )
+        return normalized
 
     def _update_interactive_map(self, force: bool = False) -> None:
         if not self._interactive_map_enabled or not self.map_view:

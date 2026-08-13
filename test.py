@@ -12,6 +12,7 @@ https://nexus.crayton.dev/
 """
 
 import importlib
+import base64
 import logging
 import os
 import sys
@@ -625,11 +626,39 @@ def test_recording_writer_flushes_frames_before_close(core_module, monkeypatch, 
     monkeypatch.setattr(core_module, "IMAGE_PATH", str(map_path))
     monkeypatch.setattr(core_module, "RECORDING_MAP_INTERVAL_S", 0.0)
     session = core_module.RecordingSession(str(recording_path), settings_snapshot={})
-    session.record_frame({"strength": 123})
+    session.record_frame(
+        {"strength": 123},
+        alerts=[{"key": "no_fix", "message": "NO FIX", "severity": "error"}],
+    )
     session.close()
     lines = recording_path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 2
+    assert '"version":3' in lines[0]
+    assert '"recorded_alerts"' in lines[0]
     assert '"strength":123' in lines[1]
+    assert '"message":"NO FIX"' in lines[1]
+
+
+def test_offline_playback_map_renders_to_png_bytes():
+    png_bytes = map_mod.renderOfflineMapBytes(
+        {
+            (35.0, -80.0): {"strength": 250, "quality": 0.8, "ts": 1.0},
+            (35.001, -80.001): {"strength": 400, "quality": 0.9, "ts": 2.0},
+        }
+    )
+    assert png_bytes is not None
+    assert png_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_offline_playback_map_can_embed_recorded_alert_banner():
+    history = {(35.0, -80.0): {"strength": 250, "quality": 0.8, "ts": 1.0}}
+    plain = map_mod.renderOfflineMapBytes(history)
+    alerted = map_mod.renderOfflineMapBytes(
+        history,
+        alerts=[{"key": "no_fix", "message": "NO FIX", "severity": "error"}],
+    )
+    assert alerted.startswith(b"\x89PNG\r\n\x1a\n")
+    assert alerted != plain
 
 
 def test_alert_manager_debounces_and_auto_clears(core_module):
@@ -1024,6 +1053,96 @@ def test_map_point_bridge_forwards_marker_selection():
     assert selected == ["fix:42"]
 
 
+def test_recorded_alerts_are_normalized_and_used_during_playback():
+    from pinpoint.main_window import MainWindow
+
+    alerts = MainWindow._normalize_recorded_alerts(
+        [
+            {"key": "no_fix", "message": "NO FIX", "severity": "error"},
+            {"message": "CUSTOM", "severity": "invalid"},
+            {"severity": "warning"},
+        ]
+    )
+    assert alerts == [
+        {"key": "no_fix", "message": "NO FIX", "severity": "error"},
+        {"key": "recorded-alert-1", "message": "CUSTOM", "severity": "warning"},
+    ]
+    window = types.SimpleNamespace(playback_mode=True, playback_alerts=alerts)
+    assert MainWindow._get_map_notifications(window) == alerts
+
+
+def test_live_telemetry_records_post_debounce_alert_snapshot():
+    from pinpoint.main_window import MainWindow
+
+    calls = []
+    recorder = types.SimpleNamespace(
+        record_frame=lambda data, alerts=None: calls.append(("record", dict(data), list(alerts or [])))
+    )
+    window = types.SimpleNamespace(
+        playback_mode=False,
+        recording_session=recorder,
+        _apply_telemetry=lambda data: calls.append(("apply", data)),
+        _get_map_notifications=lambda: [{"key": "no_sdr", "message": "NO SDR", "severity": "error"}],
+        _cache_report_frame=lambda data: calls.append(("cache", data)),
+        api=None,
+    )
+    MainWindow._on_telemetry(window, {"gps_fix": True})
+    assert calls[0][0] == "apply"
+    assert calls[1] == (
+        "record",
+        {"gps_fix": True},
+        [{"key": "no_sdr", "message": "NO SDR", "severity": "error"}],
+    )
+
+
+def test_waterfall_is_disabled_during_recording_playback():
+    from addons.diagnostics import _waterfall_enabled
+
+    class FakeAPI:
+        def __init__(self, window):
+            self.window = window
+
+        def call(self, _name):
+            return {"window": self.window}
+
+    assert _waterfall_enabled(FakeAPI(types.SimpleNamespace(playback_mode=False, playback_only=False))) is True
+    assert _waterfall_enabled(FakeAPI(types.SimpleNamespace(playback_mode=True, playback_only=False))) is False
+    assert _waterfall_enabled(FakeAPI(types.SimpleNamespace(playback_mode=False, playback_only=True))) is False
+
+
+def test_waterfall_scrolls_up_and_commits_new_spectra_without_a_jump():
+    from PyQt6 import QtWidgets
+
+    from addons.diagnostics import WaterfallWidget
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = WaterfallWidget()
+    widget._timer.stop()
+    widget.resize(760, 420)
+    widget.add_spectrum([1.0, 2.0])
+    widget.add_spectrum([3.0, 4.0])
+
+    # A new spectrum waits for the next pixel-row boundary instead of pushing
+    # the existing image by a whole row in the middle of the animation.
+    assert widget._rows == [[1.0, 2.0]]
+    assert widget._pending_row == [3.0, 4.0]
+    row_height = max(2.0, widget.height() / 120.0)
+    first_y = widget._row_y(0, row_height)
+    widget._animate()
+    assert widget._row_y(0, row_height) < first_y
+
+    # Crossing the boundary keeps the old row moving in the same direction
+    # and introduces the pending spectrum at the bottom edge.
+    widget._scroll_offset = row_height - 0.1
+    old_y = widget._row_y(0, row_height)
+    widget._animate()
+    assert widget._rows[-1] == [3.0, 4.0]
+    assert widget._pending_row is None
+    assert widget._row_y(1, row_height) == pytest.approx(old_y - widget._scroll_step)
+    widget.close()
+    del app
+
+
 def test_static_point_projection_keeps_single_point_centered():
     from pinpoint.main_window import MainWindow
 
@@ -1033,6 +1152,42 @@ def test_static_point_projection_keeps_single_point_centered():
     assert positions[0][0] is point
     assert positions[0][1] == pytest.approx(0.5)
     assert positions[0][2] == pytest.approx(0.5)
+
+
+def test_playback_history_reconstructs_map_and_skips_paused_cycles():
+    from pinpoint.main_window import MainWindow
+
+    window = types.SimpleNamespace(
+        playback_frames=[
+            {"t": 0.0, "telemetry": {"gps_loc": (35.0, -80.0), "strength": 300, "quality": 0.8}},
+            {
+                "t": 1.0,
+                "telemetry": {
+                    "gps_loc": (35.00001, -80.0),
+                    "strength": 350,
+                    "quality": 0.9,
+                    "cycle_paused": True,
+                },
+            },
+            {"t": 2.0, "telemetry": {"gps_loc": (35.001, -80.001), "strength": 500, "quality": 0.95}},
+        ]
+    )
+    history = MainWindow._playback_history_at(window, 2)
+    assert list(history) == [(35.0, -80.0), (35.001, -80.001)]
+    assert history[(35.001, -80.001)]["strength"] == 500
+
+
+def test_playback_static_map_falls_back_to_embedded_png(monkeypatch):
+    from pinpoint.main_window import MainWindow
+
+    embedded = _dummy_png_bytes()
+    window = types.SimpleNamespace(
+        playback_frames=[{"t": 0.0, "map_png": __import__("base64").b64encode(embedded).decode("ascii"), "telemetry": {}}],
+        _playback_render_cache={},
+        _playback_history_at=lambda _idx: {},
+    )
+    window._embedded_playback_map_at = types.MethodType(MainWindow._embedded_playback_map_at, window)
+    assert MainWindow._render_playback_map(window, 0) == embedded
 
 
 def test_report_cycle_marks_insufficient_movement_pause():
@@ -1060,6 +1215,66 @@ def test_report_cycle_marks_insufficient_movement_pause():
     cycles = ReportGeneratorDialog._collect_cycles(dialog)
     assert cycles[0]["paused_samples"] == 1
     assert cycles[0]["status"] == "Insufficient Movement, Paused Cycle"
+
+
+def test_report_map_history_uses_mapped_fixes_and_skips_paused_cycles():
+    from addons.report_generator import _image_signature, _report_map_history
+
+    history = _report_map_history(
+        [
+            {"t": 1.0, "telemetry": {"gps_loc": (35.0, -80.0), "strength": 100}},
+            {"t": 2.0, "telemetry": {"gps_loc": (35.1, -80.1), "strength": 200, "cycle_paused": True}},
+            {"t": 3.0, "telemetry": {"gps_loc": (35.2, -80.2), "strength": 300}},
+        ]
+    )
+    assert list(history) == [(35.0, -80.0), (35.2, -80.2)]
+    assert history[(35.2, -80.2)]["strength"] == 300
+    assert _image_signature(_dummy_png_bytes()) == _image_signature(_dummy_png_bytes())
+
+
+def test_report_map_skips_placeholder_and_uses_valid_static_image(tmp_path):
+    from addons.report_generator import ReportGeneratorDialog
+
+    logo_path = tmp_path / "logo.png"
+    map_path = tmp_path / "map.png"
+    logo = Image.new("RGB", (40, 30), "navy")
+    mission_map = Image.new("RGB", (80, 50), "green")
+    logo.save(logo_path)
+    mission_map.save(map_path)
+    embedded_logo = base64.b64encode(logo_path.read_bytes()).decode("ascii")
+    dialog = types.SimpleNamespace(
+        _map_png_b64=embedded_logo,
+        _map_cache={},
+        _data={"default_logo": str(logo_path), "map_path": str(map_path)},
+        _frames=[],
+    )
+    dialog._matches_default_logo = types.MethodType(ReportGeneratorDialog._matches_default_logo, dialog)
+    dialog._frames_cache_key = lambda: (0, None)
+
+    encoded = ReportGeneratorDialog._get_map_b64(dialog)
+    assert encoded is not None
+    with Image.open(BytesIO(base64.b64decode(encoded))) as selected:
+        assert selected.convert("RGB").getpixel((0, 0)) == (0, 128, 0)
+
+
+def test_report_cycles_use_one_continuous_paginated_table():
+    from PyQt6 import QtWidgets
+
+    from addons.report_generator import ReportGeneratorDialog
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    frames = [
+        {"t": float(index), "telemetry": {"gps_fix": True, "strength": index, "snr": 4.0}}
+        for index in range(30)
+    ]
+    dialog = ReportGeneratorDialog(None, lambda: {"frames": frames, "settings": {"collection_time": 1}})
+    dialog._preview_timer.stop()
+    html = dialog._build_html()
+    assert html.count("class='cycle-table'") == 1
+    assert "Collection Cycle Record (continued)" not in html
+    assert "DETAILED TELEMETRY REVIEW — PAGE" not in html
+    dialog.close()
+    del app
 
 
 def test_safe_float():

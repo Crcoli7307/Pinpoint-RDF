@@ -433,11 +433,12 @@ class RecordingSession:
         self._fh = open(path, "w", encoding="utf-8")
         header = {
             "type": "pinplyr",
-            "version": 2,
+            "version": 3,
             "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
             "app": APP_TITLE,
             "app_version": app_version or APP_VERSION,
             "settings": settings_snapshot or {},
+            "capabilities": ["recorded_alerts"],
         }
         self._write_line(header)
         self._writer_thread = threading.Thread(
@@ -490,11 +491,12 @@ class RecordingSession:
             finally:
                 self._queue.task_done()
 
-    def record_frame(self, telemetry: dict) -> None:
+    def record_frame(self, telemetry: dict, alerts: Optional[list[dict]] = None) -> None:
         t = time.time() - self.start_time
         frame = {
             "t": round(t, 3),
             "telemetry": dict(telemetry),
+            "alerts": [dict(alert) for alert in (alerts or []) if isinstance(alert, dict)],
         }
         self._enqueue(("frame", frame))
 
