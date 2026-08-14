@@ -730,6 +730,14 @@ class Settings:
     confidence_threshold: float = 0.4
     auto_tune_fusion: bool = True
     antenna_orientations_deg: list[float] = field(default_factory=list)
+    directional_array_enabled: bool = False
+    antenna_beamwidth_deg: float = 90.0
+    antenna_front_back_db: float = 15.0
+    heading_min_speed_knots: float = 2.0
+    heading_min_baseline_m: float = 10.0
+    heading_accuracy_factor: float = 2.0
+    heading_stale_s: float = 8.0
+    heading_smoothing: float = 0.35
     preferred_gps_port: Optional[str] = None
 
     def to_dict(self):
@@ -752,6 +760,14 @@ class Settings:
             "confidence_threshold": self.confidence_threshold,
             "auto_tune_fusion": self.auto_tune_fusion,
             "antenna_orientations_deg": list(self.antenna_orientations_deg),
+            "directional_array_enabled": self.directional_array_enabled,
+            "antenna_beamwidth_deg": self.antenna_beamwidth_deg,
+            "antenna_front_back_db": self.antenna_front_back_db,
+            "heading_min_speed_knots": self.heading_min_speed_knots,
+            "heading_min_baseline_m": self.heading_min_baseline_m,
+            "heading_accuracy_factor": self.heading_accuracy_factor,
+            "heading_stale_s": self.heading_stale_s,
+            "heading_smoothing": self.heading_smoothing,
             "preferred_gps_port": self.preferred_gps_port,
         }
 
@@ -986,26 +1002,158 @@ def _antenna_angles(n: int) -> list[float]:
     return [i * step for i in range(n)]
 
 
-def _aoa_from_strengths(strengths: list[Optional[float]], angles_deg: list[float]) -> tuple[Optional[float], float]:
+def _angle_difference_deg(a: float, b: float) -> float:
+    return (float(a) - float(b) + 180.0) % 360.0 - 180.0
+
+
+def _pattern_gain_db(relative_angle_deg: float, beamwidth_deg: float, front_back_db: float) -> float:
+    """Approximate a characterized directional antenna's relative gain."""
+    beamwidth = max(10.0, min(180.0, float(beamwidth_deg or 90.0)))
+    front_back = max(1.0, min(60.0, float(front_back_db or 15.0)))
+    offset = abs(_angle_difference_deg(relative_angle_deg, 0.0))
+    # Common parabolic main-lobe approximation; clamped by measured F/B ratio.
+    return max(-front_back, -12.0 * (offset / beamwidth) ** 2)
+
+
+def _amplitude_bearing_from_pattern(
+    strengths: list[Optional[float]],
+    angles_deg: list[float],
+    beamwidth_deg: float = 90.0,
+    front_back_db: float = 15.0,
+) -> tuple[Optional[float], float]:
+    """Estimate relative bearing by matching a directional gain pattern.
+
+    Unknown transmitter power is removed by centering measured and predicted
+    levels. This is amplitude-comparison direction finding, not phase AoA.
+    """
     if not strengths or not angles_deg:
         return None, 0.0
-    x = 0.0
-    y = 0.0
-    total = 0.0
-    for strength, angle in zip(strengths, angles_deg):
+    valid = []
+    for strength, orientation in zip(strengths, angles_deg):
         if strength is None:
             continue
-        w = max(0.0, float(strength))
-        rad = math.radians(angle)
-        x += w * math.sin(rad)
-        y += w * math.cos(rad)
-        total += w
-    if total <= 0.0:
+        try:
+            value = float(strength)
+            if value > 0.0 and math.isfinite(value):
+                valid.append((20.0 * math.log10(value), float(orientation) % 360.0))
+        except (TypeError, ValueError):
+            continue
+    if len(valid) < 2:
         return None, 0.0
-    magnitude = math.hypot(x, y)
-    bearing = math.degrees(math.atan2(x, y))
-    confidence = max(0.0, min(1.0, magnitude / total))
-    return _normalize_bearing(bearing), confidence
+
+    measured_mean = sum(value for value, _ in valid) / len(valid)
+    measured = [value - measured_mean for value, _ in valid]
+    measured_spread = math.sqrt(sum(value * value for value in measured) / len(measured))
+    if measured_spread < 0.35:
+        return None, 0.0
+
+    candidates = []
+    for candidate in range(360):
+        predicted = [
+            _pattern_gain_db(_angle_difference_deg(candidate, orientation), beamwidth_deg, front_back_db)
+            for _, orientation in valid
+        ]
+        predicted_mean = sum(predicted) / len(predicted)
+        predicted = [value - predicted_mean for value in predicted]
+        rmse = math.sqrt(sum((obs - exp) ** 2 for obs, exp in zip(measured, predicted)) / len(valid))
+        candidates.append((rmse, float(candidate)))
+    candidates.sort(key=lambda item: item[0])
+    best_error, best_bearing = candidates[0]
+    separated = [item for item in candidates if abs(_angle_difference_deg(item[1], best_bearing)) >= 20.0]
+    alternative_error = separated[0][0] if separated else best_error
+    ambiguity = max(0.0, min(1.0, (alternative_error - best_error) / max(1.0, alternative_error)))
+    fit = math.exp(-best_error / 4.0)
+    dynamic = max(0.0, min(1.0, measured_spread / 8.0))
+    channel_factor = min(1.0, (len(valid) - 1) / 3.0 + 0.35)
+    confidence = fit * ambiguity * dynamic * channel_factor
+    if confidence < 0.05:
+        return None, 0.0
+    return best_bearing, max(0.0, min(1.0, confidence))
+
+
+def _aoa_from_strengths(strengths: list[Optional[float]], angles_deg: list[float]) -> tuple[Optional[float], float]:
+    """Compatibility wrapper for older recordings/tests; returns amplitude bearing."""
+    return _amplitude_bearing_from_pattern(strengths, angles_deg)
+
+
+class _HeadingTracker:
+    """Movement-qualified, smoothed GPS course used as vehicle-array heading."""
+
+    def __init__(self):
+        self.heading = None
+        self.source = None
+        self.updated_at = None
+        self.anchor_fix = None
+
+    @staticmethod
+    def _smooth(previous, current, alpha):
+        if previous is None:
+            return _normalize_bearing(current)
+        alpha = max(0.0, min(1.0, float(alpha)))
+        delta = _angle_difference_deg(current, previous)
+        return _normalize_bearing(previous + alpha * delta)
+
+    def reset(self):
+        self.heading = None
+        self.source = None
+        self.updated_at = None
+        self.anchor_fix = None
+
+    def update(
+        self,
+        fix,
+        now: float,
+        settings_snapshot: dict,
+        course_deg=None,
+        speed_knots=None,
+        gps_accuracy_m=None,
+        motion_age_s=None,
+    ) -> dict:
+        stale_s = max(0.5, float(settings_snapshot.get("heading_stale_s", 8.0) or 8.0))
+        smoothing = float(settings_snapshot.get("heading_smoothing", 0.35) or 0.35)
+        accepted = None
+        source = None
+        try:
+            if (
+                course_deg is not None
+                and speed_knots is not None
+                and float(speed_knots) >= float(settings_snapshot.get("heading_min_speed_knots", 2.0) or 2.0)
+                and (motion_age_s is None or float(motion_age_s) <= stale_s)
+            ):
+                accepted = float(course_deg) % 360.0
+                source = "gps-course"
+        except (TypeError, ValueError):
+            accepted = None
+
+        if fix is not None:
+            try:
+                fix = (float(fix[0]), float(fix[1]))
+            except (TypeError, ValueError, IndexError):
+                fix = None
+        if accepted is None and fix is not None:
+            if self.anchor_fix is None:
+                self.anchor_fix = fix
+            else:
+                distance = _distance_m(self.anchor_fix[0], self.anchor_fix[1], fix[0], fix[1]) or 0.0
+                baseline = max(
+                    float(settings_snapshot.get("heading_min_baseline_m", 10.0) or 10.0),
+                    float(gps_accuracy_m or 0.0) * float(settings_snapshot.get("heading_accuracy_factor", 2.0) or 2.0),
+                )
+                if distance >= baseline:
+                    accepted = _bearing_deg(self.anchor_fix[0], self.anchor_fix[1], fix[0], fix[1])
+                    source = "gps-displacement"
+                    self.anchor_fix = fix
+        elif accepted is not None and fix is not None:
+            self.anchor_fix = fix
+
+        if accepted is not None:
+            self.heading = self._smooth(self.heading, accepted, smoothing)
+            self.source = source
+            self.updated_at = float(now)
+        age = None if self.updated_at is None else max(0.0, float(now) - self.updated_at)
+        if age is None or age > stale_s:
+            return {"heading": None, "source": None, "age_s": age, "valid": False}
+        return {"heading": self.heading, "source": self.source, "age_s": age, "valid": True}
 
 
 def _map_confidence(history: dict) -> float:
@@ -1062,8 +1210,13 @@ def _fuse_bearings(bearings_with_weight: list[tuple[Optional[float], float]]) ->
         total += weight
     if total <= 0:
         return None, 0.0
+    resultant = math.hypot(x, y)
+    if resultant <= 1e-9:
+        return None, 0.0
     fused = math.degrees(math.atan2(x, y))
-    return _normalize_bearing(fused), max(0.0, min(1.0, total / (sum(w for _, w in bearings_with_weight) or total)))
+    # Confidence carries both source confidence (resultant magnitude) and
+    # angular agreement (cancellation lowers that magnitude).
+    return _normalize_bearing(fused), max(0.0, min(1.0, resultant))
 
 
 def _device_key(index: int, serial: Optional[str]) -> str:
@@ -1162,6 +1315,10 @@ DEMO_DEFAULTS = {
     "update_interval_s": 0.0,
     "satellite_count": 9,
     "signal_noise": 0.08,
+    "scenario_period_s": 120.0,
+    "fault_simulation": True,
+    "antenna_beamwidth_deg": 70.0,
+    "antenna_front_back_db": 18.0,
     "seed": 1337,
 }
 
@@ -1182,6 +1339,7 @@ class DemoCollectorThread(QtCore.QThread):
             self.config.update({k: v for k, v in config.items() if v is not None})
         seed = self._cfg_int("seed", DEMO_DEFAULTS["seed"])
         self._rng = random.Random(seed)
+        self._np_rng = np.random.default_rng(seed)
 
     def _cfg_float(self, key: str, default: float) -> float:
         try:
@@ -1224,15 +1382,54 @@ class DemoCollectorThread(QtCore.QThread):
             )
         return sats
 
+    def _simulate_iq(self, wanted_amplitude: float, interference_amplitude: float, sample_count: int = 16384):
+        """Generate a bounded complex baseband capture for production DSP helpers."""
+        sample_count = max(2048, min(65536, int(sample_count)))
+        index = np.arange(sample_count, dtype=np.float64)
+        wanted_phase = self._rng.uniform(0.0, math.tau)
+        wanted = wanted_amplitude * np.exp(1j * (math.tau * 0.071 * index + wanted_phase))
+        noise_sigma = 0.018 + self._rng.uniform(0.0, 0.012)
+        noise = (
+            self._np_rng.normal(0.0, noise_sigma, sample_count)
+            + 1j * self._np_rng.normal(0.0, noise_sigma, sample_count)
+        ) / math.sqrt(2.0)
+        samples = wanted + noise
+        if interference_amplitude > 0.0:
+            interferer_phase = self._rng.uniform(0.0, math.tau)
+            samples += interference_amplitude * np.exp(
+                1j * (math.tau * 0.19 * index + interferer_phase)
+            )
+            # Short impulsive bursts make the waterfall and quality panel react.
+            for _ in range(3):
+                start = self._rng.randrange(0, max(1, sample_count - 128))
+                width = self._rng.randrange(32, 128)
+                samples[start:start + width] += self._np_rng.normal(0.0, interference_amplitude, width)
+        return np.asarray(samples, dtype=np.complex128)
+
+    @staticmethod
+    def _route_offset(radius_m: float, phase: float) -> tuple[float, float]:
+        """Irregular patrol route in local east/north metres."""
+        east = radius_m * (0.78 * math.sin(phase) + 0.18 * math.sin(3.0 * phase + 0.4))
+        north = radius_m * (0.52 * math.sin(2.0 * phase) + 0.13 * math.cos(5.0 * phase))
+        return east, north
+
+    def _offset_east_north(self, lat: float, lon: float, east_m: float, north_m: float) -> tuple[float, float]:
+        meters_per_lon = max(1.0, 111_320.0 * math.cos(math.radians(lat)))
+        return lat + north_m / 111_320.0, lon + east_m / meters_per_lon
+
     def run(self):
         history = {}
+        bearing_observations = []
+        heading_tracker = _HeadingTracker()
         last_map_update = 0.0
         last_fix = None
         last_fix_time = None
         last_satellites = []
         last_sat_update = 0.0
         start_time = time.time()
-        start_angle_deg = self._cfg_float("start_angle_deg", self._rng.uniform(0.0, 360.0))
+        last_loop_time = start_time
+        route_phase = math.radians(self._cfg_float("start_angle_deg", self._rng.uniform(0.0, 360.0)))
+        last_truth_fix = None
         self.logger.info("Demo collector thread started.")
         try:
             while not self.stop_event.is_set():
@@ -1255,74 +1452,183 @@ class DemoCollectorThread(QtCore.QThread):
                 antenna_count = max(1, self._cfg_int("antenna_count", int(s.get("antenna_count") or 1)))
                 satellite_count = max(4, self._cfg_int("satellite_count", DEMO_DEFAULTS["satellite_count"]))
                 noise = max(0.0, min(0.5, self._cfg_float("signal_noise", DEMO_DEFAULTS["signal_noise"])))
+                scenario_period = max(30.0, self._cfg_float("scenario_period_s", DEMO_DEFAULTS["scenario_period_s"]))
+                scenario_phase = ((now - start_time) % scenario_period) / scenario_period
+                faults = bool(self.config.get("fault_simulation", True))
+                interference_active = faults and 0.18 <= scenario_phase < 0.30
+                gps_degraded = faults and 0.36 <= scenario_phase < 0.47
+                gps_outage = faults and 0.43 <= scenario_phase < 0.47
+                sdr_dropout = faults and 0.54 <= scenario_phase < 0.61
+                stopped = faults and 0.67 <= scenario_phase < 0.74
+                multipath_active = faults and 0.78 <= scenario_phase < 0.91
+                scenario_name = (
+                    "INTERFERENCE" if interference_active else
+                    "GPS OUTAGE" if gps_outage else
+                    "GPS DEGRADED" if gps_degraded else
+                    "SDR DROPOUT" if sdr_dropout else
+                    "STATIONARY" if stopped else
+                    "MULTIPATH" if multipath_active else
+                    "NOMINAL PATROL"
+                )
 
-                # Movement along a circular path
+                # Irregular patrol with turns, crossing geometry, and a planned stop.
                 elapsed = now - start_time
-                angular_speed = speed_mps / max(radius_m, 1.0)
-                angle = math.radians(start_angle_deg) + angular_speed * elapsed
-                lat, lon = self._offset_lat_lon(center_lat, center_lon, radius_m, angle)
+                dt = max(0.0, min(5.0, now - last_loop_time))
+                last_loop_time = now
+                if not stopped:
+                    route_phase += (speed_mps / max(radius_m, 1.0)) * dt
+                east_m, north_m = self._route_offset(radius_m, route_phase)
+                truth_lat, truth_lon = self._offset_east_north(center_lat, center_lon, east_m, north_m)
+                truth_course = (
+                    _bearing_deg(last_truth_fix[0], last_truth_fix[1], truth_lat, truth_lon)
+                    if last_truth_fix and not stopped else None
+                )
+                if not stopped:
+                    last_truth_fix = (truth_lat, truth_lon)
 
-                current_bearing = None
-                if last_fix is not None:
-                    current_bearing = _bearing_deg(last_fix[0], last_fix[1], lat, lon)
-                last_fix = (lat, lon)
-                last_fix_time = now
+                gps_accuracy_m = 32.0 if gps_degraded else 3.5
+                jitter_scale = gps_accuracy_m / 2.0
+                jitter_east = self._rng.gauss(0.0, jitter_scale)
+                jitter_north = self._rng.gauss(0.0, jitter_scale)
+                observed_lat, observed_lon = self._offset_east_north(
+                    truth_lat, truth_lon, jitter_east, jitter_north
+                )
+                gps_fix = not gps_outage
+                lat, lon = (observed_lat, observed_lon) if gps_fix else (last_fix or (observed_lat, observed_lon))
+                cycle_paused = bool(stopped and gps_fix)
+                map_cycle_accepted = bool(gps_fix and not cycle_paused)
+                pause_reason = "Insufficient Movement, Paused Cycle" if cycle_paused else None
+
+                heading_state = heading_tracker.update(
+                    (lat, lon) if gps_fix else None, now, s,
+                    course_deg=truth_course,
+                    speed_knots=0.0 if stopped else speed_mps * 1.94384,
+                    gps_accuracy_m=gps_accuracy_m,
+                    motion_age_s=0.0,
+                )
+                current_bearing = heading_state["heading"]
+                if gps_fix:
+                    last_fix = (lat, lon)
+                    last_fix_time = now
 
                 target_angle = math.radians(target_bearing_deg)
                 target_lat, target_lon = self._offset_lat_lon(center_lat, center_lon, target_distance_m, target_angle)
                 target_bearing = _bearing_deg(lat, lon, target_lat, target_lon)
                 target_relative = _relative_bearing(target_bearing, current_bearing)
 
-                dist_m = self._approx_distance_m(lat, lon, target_lat, target_lon)
-                base_strength = 1000.0 / (1.0 + (dist_m / 120.0) ** 2)
-                strength = int(max(1, min(1000, base_strength + self._rng.uniform(-30.0, 30.0))))
-                snr = max(0.1, 5.0 + (strength / 1000.0) * 20.0 + self._rng.uniform(-1.5, 1.5))
-                quality = max(0.0, min(1.0, (strength / 1000.0) + self._rng.uniform(-noise, noise)))
+                dist_m = self._approx_distance_m(truth_lat, truth_lon, target_lat, target_lon)
+                wanted_amplitude = 0.72 / (1.0 + (dist_m / 170.0) ** 1.65)
+                wanted_amplitude *= 1.0 + self._rng.gauss(0.0, noise * 0.2)
 
+                visible_satellites = max(3, satellite_count - 5) if gps_degraded else satellite_count
                 if now - last_sat_update >= 5.0 or not last_satellites:
-                    last_satellites = self._build_satellites(satellite_count)
+                    last_satellites = self._build_satellites(visible_satellites)
                     last_sat_update = now
 
-                # Simulate per-antenna strengths
+                # Generate per-antenna IQ and run the production processing path.
                 angles = _antenna_angles(antenna_count)
                 rel_for_calc = target_relative if target_relative is not None else 0.0
                 strengths = []
+                snrs = []
+                qualities = []
                 antenna_states = []
                 for idx, angle_deg in enumerate(angles):
-                    diff = math.radians((angle_deg - rel_for_calc) % 360.0)
-                    directional = max(0.05, math.cos(diff))
-                    ant_strength = max(
-                        1,
-                        int(strength * (0.4 + 0.6 * directional) + self._rng.uniform(-15.0, 15.0)),
+                    connected = not (sdr_dropout and idx == antenna_count - 1)
+                    if not connected:
+                        antenna_states.append(
+                            {
+                                "index": idx, "name": "Demo RTL-SDR", "serial": f"DEMO-{idx + 1:02d}",
+                                "connected": False, "error": "Simulated USB receiver dropout",
+                                "sample_rate": 2.048e6, "strength": None, "snr": None, "quality": None,
+                                "health": "Unhealthy", "health_reason": "Simulated receiver dropout",
+                                "sample_count": 0, "read_latency_ms": None, "spectrum_db": [],
+                            }
+                        )
+                        strengths.append(None)
+                        continue
+                    gain_db = _pattern_gain_db(
+                        _angle_difference_deg(rel_for_calc, angle_deg),
+                        self._cfg_float("antenna_beamwidth_deg", 70.0),
+                        self._cfg_float("antenna_front_back_db", 18.0),
                     )
+                    channel_amplitude = wanted_amplitude * (10.0 ** (gain_db / 20.0))
+                    if multipath_active:
+                        channel_amplitude *= max(
+                            0.15,
+                            1.0 + 0.55 * math.sin(route_phase * 11.0 + idx * 1.7) + self._rng.gauss(0.0, 0.18),
+                        )
+                    interference_amplitude = 0.42 + 0.08 * idx if interference_active else 0.0
+                    samples = self._simulate_iq(channel_amplitude, interference_amplitude)
+                    processed = funcs.processSamples(samples)
+                    ant_strength = funcs.calculateSignalStrength(processed)
+                    metrics = funcs.calculateSignalQuality(processed)
+                    ant_snr = metrics.get("snr", 0.0)
+                    ant_quality = metrics.get("quality", 0.0)
                     strengths.append(ant_strength)
+                    snrs.append(ant_snr)
+                    qualities.append(ant_quality)
+                    degraded = interference_active or multipath_active or ant_quality < 0.15
                     antenna_states.append(
                         {
                             "index": idx,
-                            "name": "Demo SDR",
+                            "name": "Demo RTL-SDR",
                             "serial": f"DEMO-{idx + 1:02d}",
                             "connected": True,
                             "error": None,
                             "sample_rate": 2.048e6,
                             "strength": ant_strength,
-                            "snr": snr,
-                            "quality": quality,
+                            "snr": ant_snr,
+                            "quality": ant_quality,
+                            "power_dbfs": metrics.get("power_dbfs"),
+                            "health": "Degraded" if degraded else "Healthy",
+                            "health_reason": scenario_name if degraded else "Capture and signal metrics normal",
+                            "read_latency_ms": self._rng.uniform(40.0, 120.0),
+                            "sample_count": len(samples),
+                            "spectrum_db": funcs.calculateSpectrum(samples),
                         }
                     )
 
-                aoa_relative, aoa_confidence = _aoa_from_strengths(strengths, angles)
-                aoa_confidence *= _spacing_factor(freq_mhz, spacing_in)
+                connected_strengths = [value for value in strengths if value is not None]
+                strength = int(np.mean(connected_strengths)) if connected_strengths else None
+                snr = float(np.mean(snrs)) if snrs else None
+                quality = float(np.mean(qualities)) if qualities else None
+
+                aoa_relative, aoa_confidence = _amplitude_bearing_from_pattern(
+                    strengths,
+                    angles,
+                    self._cfg_float("antenna_beamwidth_deg", 70.0),
+                    self._cfg_float("antenna_front_back_db", 18.0),
+                )
                 aoa_bearing = None
                 if aoa_relative is not None and current_bearing is not None:
                     aoa_bearing = _normalize_bearing(current_bearing + aoa_relative)
 
-                history[(lat, lon)] = {
-                    "strength": strength,
-                    "quality": quality,
-                    "snr": snr,
-                    "ts": now,
-                }
-                _prune_history(history, now)
+                target_estimate = None
+                if map_cycle_accepted and antenna_count >= 2 and aoa_bearing is not None and aoa_confidence >= 0.05:
+                    bearing_observations.append(
+                        {
+                            "lat": lat,
+                            "lon": lon,
+                            "bearing_deg": aoa_bearing,
+                            "confidence": aoa_confidence,
+                        }
+                    )
+                    bearing_observations = bearing_observations[-100:]
+                    try:
+                        target_estimate = funcs.estimateTransmitterFromBearings(
+                            bearing_observations, self.logger
+                        )
+                    except ValueError:
+                        target_estimate = None
+
+                if map_cycle_accepted and strength is not None:
+                    history[(lat, lon)] = {
+                        "strength": strength,
+                        "quality": quality,
+                        "snr": snr,
+                        "ts": now,
+                    }
+                    _prune_history(history, now)
 
                 # Update map image
                 if history:
@@ -1356,7 +1662,8 @@ class DemoCollectorThread(QtCore.QThread):
                         map_factor *= 0.1
                     aoa_w *= aoa_factor
                     map_w *= map_factor
-                    conf_threshold = max(0.05, min(0.95, conf_threshold * (1.1 - 0.6 * float(quality))))
+                    if quality is not None:
+                        conf_threshold = max(0.05, min(0.95, conf_threshold * (1.1 - 0.6 * float(quality))))
                 weight_total = max(1e-6, aoa_w + map_w)
                 aoa_w /= weight_total
                 map_w /= weight_total
@@ -1377,37 +1684,39 @@ class DemoCollectorThread(QtCore.QThread):
                     bearing_source = "fused"
                 elif aoa_bearing is not None and aoa_confidence >= conf_threshold:
                     target_bearing_out = aoa_bearing
-                    bearing_source = "aoa"
+                    bearing_source = "amplitude"
                 elif map_target_bearing is not None and map_confidence >= conf_threshold:
                     target_bearing_out = map_target_bearing
                     bearing_source = "map"
-                else:
-                    if aoa_bearing is not None:
-                        target_bearing_out = aoa_bearing
-                        bearing_source = "aoa"
-                    else:
-                        target_bearing_out = map_target_bearing
-                        bearing_source = "map" if map_target_bearing is not None else None
+                # No below-threshold fallback: absence is safer than publishing
+                # a direction the configured confidence policy rejected.
 
                 target_relative_out = _relative_bearing(target_bearing_out, current_bearing)
 
                 fix_age = None if last_fix_time is None else max(0.0, now - last_fix_time)
                 self.telemetry.emit(
                     {
-                        "gps_fix": True,
+                        "gps_fix": gps_fix,
                         "gps_loc": (lat, lon),
                         "sats": len(last_satellites),
                         "fix_age_s": fix_age,
+                        "gps_hdop": 6.4 if gps_degraded else 0.8,
+                        "gps_accuracy_m": gps_accuracy_m,
+                        "gps_speed_knots": 0.0 if stopped else speed_mps * 1.94384,
+                        "gps_course_deg": truth_course,
                         "strength": strength,
                         "snr": snr,
                         "quality": quality,
                         "satellites": last_satellites,
-                        "sdr_connected": True,
-                        "sdr_error": None,
+                        "sdr_connected": bool(connected_strengths),
+                        "sdr_error": "Simulated SDR dropout" if sdr_dropout else None,
                         "sdr_sample_rate": 2.048e6,
                         "antenna_count": antenna_count,
                         "antenna_states": antenna_states,
                         "current_bearing": current_bearing,
+                        "heading_source": heading_state.get("source"),
+                        "heading_age_s": heading_state.get("age_s"),
+                        "heading_valid": heading_state.get("valid"),
                         "target_bearing": target_bearing_out,
                         "target_relative": target_relative_out,
                         "aoa_bearing": aoa_bearing,
@@ -1417,6 +1726,18 @@ class DemoCollectorThread(QtCore.QThread):
                         "map_confidence": map_confidence,
                         "fusion_confidence": fusion_confidence,
                         "bearing_source": bearing_source,
+                        "target_estimate": target_estimate,
+                        "demo_scenario": scenario_name,
+                        "interference_detected": interference_active,
+                        "multipath_active": multipath_active,
+                        "cycle_paused": cycle_paused,
+                        "pause_reason": pause_reason,
+                        "map_cycle_accepted": map_cycle_accepted,
+                        "movement_distance_m": 0.0 if cycle_paused else None,
+                        "movement_threshold_m": (
+                            _effective_movement_threshold_m(s, gps_accuracy_m)
+                            if cycle_paused else None
+                        ),
                         "calculation_parameters": {
                             "configured_settings": dict(s),
                             "effective": {
@@ -1428,7 +1749,8 @@ class DemoCollectorThread(QtCore.QThread):
                                 "fusion_aoa_weight": aoa_w,
                                 "fusion_map_weight": map_w,
                                 "confidence_threshold": conf_threshold,
-                                "bearing_method": "amplitude-derived",
+                                "bearing_method": "directional-pattern amplitude comparison",
+                                "demo_generated_iq": True,
                             },
                         },
                     }
@@ -1633,6 +1955,8 @@ class CollectorThread(QtCore.QThread):
 
     def run(self):
         history = {}
+        bearing_observations = []
+        heading_tracker = _HeadingTracker()
         sdr_state = {}
         last_sdr_scan = 0.0
         gps_serial = None
@@ -1696,6 +2020,8 @@ class CollectorThread(QtCore.QThread):
                         last_satellites = []
                         prev_fix = None
                         last_mapped_fix = None
+                        bearing_observations = []
+                        heading_tracker.reset()
                         current_bearing = None
                         gps_failures = 0
                         gps_next_retry = 0.0
@@ -1820,8 +2146,6 @@ class CollectorThread(QtCore.QThread):
                             last_fix = present_gps_loc
                             last_fix_time = time.time()
                             has_fresh_fix = True
-                            if prev_fix is not None:
-                                current_bearing = _bearing_deg(prev_fix[0], prev_fix[1], lat, lon)
                             prev_fix = present_gps_loc
 
                     if present_gps_loc is not None:
@@ -1842,6 +2166,18 @@ class CollectorThread(QtCore.QThread):
 
                     fix_age = None if last_fix_time is None else max(0.0, time.time() - last_fix_time)
                     gps_fix_valid = _gps_fix_is_current(present_gps_loc, last_fix_time)
+                    motion_ts = gps_metadata.get("motion_ts")
+                    motion_age_s = None if motion_ts is None else max(0.0, time.time() - float(motion_ts))
+                    heading_state = heading_tracker.update(
+                        present_gps_loc if has_fresh_fix else None,
+                        time.time(),
+                        s,
+                        course_deg=gps_metadata.get("course_deg"),
+                        speed_knots=gps_metadata.get("speed_knots"),
+                        gps_accuracy_m=gps_accuracy_m,
+                        motion_age_s=motion_age_s,
+                    )
+                    current_bearing = heading_state["heading"]
                     antenna_states = []
                     strengths = []
                     qualities = []
@@ -2084,14 +2420,14 @@ class CollectorThread(QtCore.QThread):
                     map_confidence = 0.0
                     fusion_confidence = 0.0
                     bearing_source = None
-                    target_estimate = None
+                    signal_target_estimate = None
                     try:
-                        target_estimate = funcs.estimateTransmitterLocation(history, self.logger) if history else None
+                        signal_target_estimate = funcs.estimateTransmitterLocation(history, self.logger) if history else None
                     except ValueError:
-                        target_estimate = None
+                        signal_target_estimate = None
                     target_loc = (
-                        (target_estimate["lat"], target_estimate["lon"])
-                        if target_estimate
+                        (signal_target_estimate["lat"], signal_target_estimate["lon"])
+                        if signal_target_estimate
                         else _estimate_target_from_history(history)
                     )
                     if present_gps_loc and target_loc:
@@ -2101,19 +2437,52 @@ class CollectorThread(QtCore.QThread):
 
                     aoa_relative = None
                     aoa_bearing = None
-                    if antenna_states:
+                    angles = []
+                    if antenna_states and bool(s.get("directional_array_enabled", False)):
                         configured_angles = s.get("antenna_orientations_deg") or []
-                        if len(configured_angles) >= len(antenna_states):
-                            angles = [float(v) % 360.0 for v in configured_angles[: len(antenna_states)]]
-                        else:
-                            angles = _antenna_angles(len(antenna_states))
-                        aoa_relative, aoa_confidence = _aoa_from_strengths(
-                            [a.get("strength") if a.get("connected") else None for a in antenna_states],
-                            angles,
+                        if len(configured_angles) == len(antenna_states):
+                            try:
+                                angles = [float(v) % 360.0 for v in configured_angles]
+                            except (TypeError, ValueError):
+                                angles = []
+                            if angles:
+                                aoa_relative, aoa_confidence = _amplitude_bearing_from_pattern(
+                                    [a.get("strength") if a.get("connected") else None for a in antenna_states],
+                                    angles,
+                                    s.get("antenna_beamwidth_deg", 90.0),
+                                    s.get("antenna_front_back_db", 15.0),
+                                )
+                                if aoa_relative is not None and current_bearing is not None:
+                                    aoa_bearing = _normalize_bearing(current_bearing + aoa_relative)
+
+                    target_estimate = None
+                    connected_array_channels = sum(
+                        1 for state in antenna_states
+                        if state.get("connected") and state.get("strength") is not None
+                    )
+                    if (
+                        map_cycle_accepted
+                        and present_gps_loc
+                        and connected_array_channels >= 2
+                        and aoa_bearing is not None
+                        and aoa_confidence >= 0.05
+                    ):
+                        bearing_observations.append(
+                            {
+                                "lat": present_gps_loc[0],
+                                "lon": present_gps_loc[1],
+                                "bearing_deg": aoa_bearing,
+                                "confidence": aoa_confidence,
+                            }
                         )
-                        aoa_confidence *= _spacing_factor(freq_mhz, spacing_in)
-                        if aoa_relative is not None and current_bearing is not None:
-                            aoa_bearing = _normalize_bearing(current_bearing + aoa_relative)
+                        bearing_observations = bearing_observations[-100:]
+                    if connected_array_channels >= 2:
+                        try:
+                            target_estimate = funcs.estimateTransmitterFromBearings(
+                                bearing_observations, self.logger
+                            )
+                        except ValueError:
+                            target_estimate = None
 
                     map_confidence = _map_confidence(history)
 
@@ -2151,18 +2520,12 @@ class CollectorThread(QtCore.QThread):
                         bearing_source = "fused"
                     elif aoa_bearing is not None and aoa_confidence >= conf_threshold:
                         target_bearing = aoa_bearing
-                        bearing_source = "aoa"
+                        bearing_source = "amplitude"
                     elif map_target_bearing is not None and map_confidence >= conf_threshold:
                         target_bearing = map_target_bearing
                         bearing_source = "map"
-                    else:
-                        # fall back to the strongest available source
-                        if aoa_bearing is not None:
-                            target_bearing = aoa_bearing
-                            bearing_source = "aoa"
-                        else:
-                            target_bearing = map_target_bearing
-                            bearing_source = "map" if map_target_bearing is not None else None
+                    # No below-threshold fallback: absence is safer than a
+                    # direction rejected by the configured confidence policy.
 
                     target_relative = _relative_bearing(target_bearing, current_bearing)
 
@@ -2191,6 +2554,9 @@ class CollectorThread(QtCore.QThread):
                             "antenna_count": actual_antenna_count,
                             "antenna_states": antenna_states,
                             "current_bearing": current_bearing,
+                            "heading_source": heading_state.get("source"),
+                            "heading_age_s": heading_state.get("age_s"),
+                            "heading_valid": heading_state.get("valid"),
                             "target_bearing": target_bearing,
                             "target_relative": target_relative,
                             "aoa_bearing": aoa_bearing,
@@ -2213,7 +2579,7 @@ class CollectorThread(QtCore.QThread):
                             "measurement_ts": measurement_ts,
                             "gps_fix_ts": last_fix_time,
                             "gps_measurement_offset_ms": gps_measurement_offset_ms,
-                            "bearing_method": "amplitude-derived",
+                            "bearing_method": "directional-pattern amplitude comparison",
                             "target_estimate": target_estimate,
                             "calculation_parameters": {
                                 "configured_settings": dict(s),
@@ -2227,7 +2593,7 @@ class CollectorThread(QtCore.QThread):
                                     "fusion_map_weight": map_w,
                                     "confidence_threshold": conf_threshold,
                                     "movement_threshold_m": movement_threshold_m,
-                                    "bearing_method": "amplitude-derived",
+                                    "bearing_method": "directional-pattern amplitude comparison",
                                 },
                             },
                         }

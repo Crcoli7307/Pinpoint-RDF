@@ -32,6 +32,7 @@ from .gps import (
 from .map import (
     predictTransmitterLocation,
     estimateTransmitterLocation,
+    estimateTransmitterFromBearings,
     renderOfflineMapBytes,
     overlayAlertsOnMapBytes,
     mapFunction,
@@ -55,6 +56,7 @@ __all__ = [
     'list_sdr_devices',
     'predictTransmitterLocation',
     'estimateTransmitterLocation',
+    'estimateTransmitterFromBearings',
     'renderOfflineMapBytes',
     'overlayAlertsOnMapBytes',
     'mapFunction',

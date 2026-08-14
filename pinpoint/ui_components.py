@@ -37,6 +37,12 @@ class SettingsDialog(QtWidgets.QDialog):
         self.gps_accuracy_floor_input = QtWidgets.QLineEdit()
         self.adaptive_movement_checkbox = QtWidgets.QCheckBox("Use GPS accuracy to increase movement threshold")
         self.orientation_input = QtWidgets.QLineEdit()
+        self.directional_array_checkbox = QtWidgets.QCheckBox("Enable characterized directional amplitude array")
+        self.beamwidth_input = QtWidgets.QLineEdit()
+        self.front_back_input = QtWidgets.QLineEdit()
+        self.heading_min_speed_input = QtWidgets.QLineEdit()
+        self.heading_baseline_input = QtWidgets.QLineEdit()
+        self.heading_stale_input = QtWidgets.QLineEdit()
         self.alert_debounce_input = QtWidgets.QLineEdit()
         self.profile_input = QtWidgets.QLineEdit()
         self.aoa_weight_input = QtWidgets.QLineEdit()
@@ -60,6 +66,11 @@ class SettingsDialog(QtWidgets.QDialog):
         self.aoa_weight_input.setValidator(QtGui.QDoubleValidator(0.0, 1.0, 2))
         self.map_weight_input.setValidator(QtGui.QDoubleValidator(0.0, 1.0, 2))
         self.conf_threshold_input.setValidator(QtGui.QDoubleValidator(0.0, 1.0, 2))
+        self.beamwidth_input.setValidator(QtGui.QDoubleValidator(10.0, 180.0, 1))
+        self.front_back_input.setValidator(QtGui.QDoubleValidator(1.0, 60.0, 1))
+        self.heading_min_speed_input.setValidator(QtGui.QDoubleValidator(0.0, 100.0, 1))
+        self.heading_baseline_input.setValidator(QtGui.QDoubleValidator(1.0, 1000.0, 1))
+        self.heading_stale_input.setValidator(QtGui.QDoubleValidator(0.5, 120.0, 1))
 
         with settings_lock:
             self.freq_input.setText(str(settings.frequency))
@@ -74,6 +85,12 @@ class SettingsDialog(QtWidgets.QDialog):
             self.gps_accuracy_floor_input.setText(str(settings.gps_accuracy_floor_m))
             self.adaptive_movement_checkbox.setChecked(bool(settings.adaptive_movement_pause))
             self.orientation_input.setText(", ".join(str(v) for v in settings.antenna_orientations_deg))
+            self.directional_array_checkbox.setChecked(bool(settings.directional_array_enabled))
+            self.beamwidth_input.setText(str(settings.antenna_beamwidth_deg))
+            self.front_back_input.setText(str(settings.antenna_front_back_db))
+            self.heading_min_speed_input.setText(str(settings.heading_min_speed_knots))
+            self.heading_baseline_input.setText(str(settings.heading_min_baseline_m))
+            self.heading_stale_input.setText(str(settings.heading_stale_s))
             self.alert_debounce_input.setText(str(settings.alert_debounce_cycles))
             self.profile_input.setText(str(settings.calibration_profile))
             self.aoa_weight_input.setText(str(settings.fusion_aoa_weight))
@@ -111,6 +128,12 @@ class SettingsDialog(QtWidgets.QDialog):
         form.addRow("GPS Accuracy Multiplier", self.movement_accuracy_factor_input)
         form.addRow("GPS Accuracy Floor (m)", self.gps_accuracy_floor_input)
         form.addRow("Antenna Orientations (deg CSV)", self.orientation_input)
+        form.addRow("Directional Array", self.directional_array_checkbox)
+        form.addRow("Antenna 3 dB Beamwidth (deg)", self.beamwidth_input)
+        form.addRow("Antenna Front/Back Ratio (dB)", self.front_back_input)
+        form.addRow("Heading Minimum Speed (kn)", self.heading_min_speed_input)
+        form.addRow("Heading GPS Baseline (m)", self.heading_baseline_input)
+        form.addRow("Heading Expiry (s)", self.heading_stale_input)
         form.addRow("Alert Debounce (cycles)", self.alert_debounce_input)
         form.addRow("Calibration Profile", self.profile_input)
         form.addRow("Fusion Weight (Amplitude)", self.aoa_weight_input)
@@ -154,12 +177,25 @@ class SettingsDialog(QtWidgets.QDialog):
                     for value in self.orientation_input.text().split(",")
                     if value.strip()
                 ]
+            if self.directional_array_checkbox.isChecked() and len(orientations) != antenna_count:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Directional Array Profile Required",
+                    "Directional amplitude comparison requires one physical orientation for every configured antenna. "
+                    f"Enter exactly {antenna_count} comma-separated orientations, or disable Directional Array.",
+                )
+                return
             alert_debounce_cycles = int(self.alert_debounce_input.text())
             profile = self.profile_input.text().strip() or "default"
             aoa_weight = float(self.aoa_weight_input.text())
             map_weight = float(self.map_weight_input.text())
             conf_threshold = float(self.conf_threshold_input.text())
             auto_tune = self.auto_tune_checkbox.isChecked()
+            beamwidth_deg = float(self.beamwidth_input.text())
+            front_back_db = float(self.front_back_input.text())
+            heading_min_speed = float(self.heading_min_speed_input.text())
+            heading_baseline = float(self.heading_baseline_input.text())
+            heading_stale = float(self.heading_stale_input.text())
             with settings_lock:
                 settings.frequency = freq
                 settings.gain = gain
@@ -173,6 +209,12 @@ class SettingsDialog(QtWidgets.QDialog):
                 settings.movement_accuracy_factor = max(0.0, movement_accuracy_factor)
                 settings.gps_accuracy_floor_m = max(0.0, gps_accuracy_floor_m)
                 settings.antenna_orientations_deg = orientations
+                settings.directional_array_enabled = self.directional_array_checkbox.isChecked()
+                settings.antenna_beamwidth_deg = max(10.0, min(180.0, beamwidth_deg))
+                settings.antenna_front_back_db = max(1.0, min(60.0, front_back_db))
+                settings.heading_min_speed_knots = max(0.0, heading_min_speed)
+                settings.heading_min_baseline_m = max(1.0, heading_baseline)
+                settings.heading_stale_s = max(0.5, heading_stale)
                 settings.alert_debounce_cycles = max(1, alert_debounce_cycles)
                 settings.calibration_profile = profile
                 settings.fusion_aoa_weight = aoa_weight

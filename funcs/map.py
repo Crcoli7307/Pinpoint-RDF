@@ -121,6 +121,149 @@ def estimateTransmitterLocation(history, logger):
         "method": "signal-weighted centroid",
     }
 
+
+def estimateTransmitterFromBearings(observations, logger=None):
+    """Triangulate a transmitter and uncertainty ellipse from array bearings.
+
+    Each observation must contain ``lat``, ``lon``, and an absolute
+    ``bearing_deg`` derived from a multi-antenna array. Three spatially distinct
+    observations are required so an incidental crossing of two noisy rays is
+    not presented as a defensible location estimate.
+    """
+    valid = []
+    for item in observations or []:
+        try:
+            lat = float(item.get("lat"))
+            lon = float(item.get("lon"))
+            bearing = float(item.get("bearing_deg")) % 360.0
+            confidence = max(0.05, min(1.0, float(item.get("confidence", 0.5) or 0.5)))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if all(math.isfinite(value) for value in (lat, lon, bearing, confidence)):
+            valid.append((lat, lon, bearing, confidence))
+    if len(valid) < 3:
+        raise ValueError("At least three valid array-bearing observations are required.")
+
+    # Collapse repeated samples at essentially the same fix. Remaining points
+    # must span a useful baseline; stationary bearings do not locate a source.
+    unique = []
+    for item in valid:
+        if not any(abs(item[0] - prior[0]) < 1e-7 and abs(item[1] - prior[1]) < 1e-7 for prior in unique):
+            unique.append(item)
+    if len(unique) < 3:
+        raise ValueError("Three spatially distinct fixes are required for triangulation.")
+    valid = unique[-100:]
+
+    reference_lat = sum(item[0] for item in valid) / len(valid)
+    reference_lon = sum(item[1] for item in valid) / len(valid)
+    meters_per_lat = 111_320.0
+    meters_per_lon = max(1.0, 111_320.0 * math.cos(math.radians(reference_lat)))
+    projected = [
+        (
+            (lon - reference_lon) * meters_per_lon,
+            (lat - reference_lat) * meters_per_lat,
+            math.sin(math.radians(bearing)),
+            math.cos(math.radians(bearing)),
+            confidence,
+        )
+        for lat, lon, bearing, confidence in valid
+    ]
+    baseline_m = max(
+        math.hypot(a[0] - b[0], a[1] - b[1])
+        for index, a in enumerate(projected)
+        for b in projected[index + 1:]
+    )
+    if baseline_m < 10.0:
+        raise ValueError("The bearing fixes do not span the required 10 metre baseline.")
+
+    # Weighted least-squares intersection of bearing lines:
+    # sum(w * (I - d d^T)) x = sum(w * (I - d d^T) p).
+    a00 = a01 = a11 = b0 = b1 = total_weight = 0.0
+    for east, north, dir_east, dir_north, weight in projected:
+        n00 = 1.0 - dir_east * dir_east
+        n01 = -dir_east * dir_north
+        n11 = 1.0 - dir_north * dir_north
+        a00 += weight * n00
+        a01 += weight * n01
+        a11 += weight * n11
+        b0 += weight * (n00 * east + n01 * north)
+        b1 += weight * (n01 * east + n11 * north)
+        total_weight += weight
+    determinant = a00 * a11 - a01 * a01
+    trace = a00 + a11
+    discriminant = math.sqrt(max(0.0, (a00 - a11) ** 2 + 4.0 * a01 * a01))
+    normal_min = (trace - discriminant) / 2.0
+    normal_max = (trace + discriminant) / 2.0
+    geometry_ratio = normal_min / max(1e-9, normal_max)
+    if determinant <= 1e-9 or geometry_ratio < 0.02:
+        raise ValueError("Array bearings are too nearly parallel to triangulate reliably.")
+    estimate_east = (b0 * a11 - b1 * a01) / determinant
+    estimate_north = (a00 * b1 - a01 * b0) / determinant
+
+    forward = 0
+    residuals = []
+    angular_errors = []
+    for east, north, dir_east, dir_north, weight in projected:
+        delta_east = estimate_east - east
+        delta_north = estimate_north - north
+        along = delta_east * dir_east + delta_north * dir_north
+        if along > 0.0:
+            forward += 1
+        residuals.append((delta_east * dir_north - delta_north * dir_east, weight))
+        angle_error_deg = 5.0 + 25.0 * (1.0 - weight)
+        angular_errors.append((abs(along) * math.tan(math.radians(angle_error_deg)), weight))
+    if forward < max(2, math.ceil(len(projected) * 0.6)):
+        raise ValueError("Most bearing rays intersect behind the antenna array.")
+
+    residual_variance = sum(weight * residual * residual for residual, weight in residuals) / total_weight
+    angular_variance = sum(weight * error * error for error, weight in angular_errors) / total_weight
+    noise_variance = max(8.0 ** 2, residual_variance, angular_variance)
+
+    # Invert the normalized normal matrix to turn bearing geometry and observed
+    # error into a two-dimensional uncertainty covariance.
+    n00 = a00 / total_weight
+    n01 = a01 / total_weight
+    n11 = a11 / total_weight
+    n_det = n00 * n11 - n01 * n01
+    cov00 = noise_variance * n11 / n_det
+    cov01 = -noise_variance * n01 / n_det
+    cov11 = noise_variance * n00 / n_det
+    cov_trace = cov00 + cov11
+    cov_disc = math.sqrt(max(0.0, (cov00 - cov11) ** 2 + 4.0 * cov01 * cov01))
+    major_variance = max(1.0, (cov_trace + cov_disc) / 2.0)
+    minor_variance = max(1.0, (cov_trace - cov_disc) / 2.0)
+    major_radius = min(10_000.0, max(10.0, math.sqrt(major_variance)))
+    minor_radius = min(major_radius, max(8.0, math.sqrt(minor_variance)))
+    # Eigenvector angle, expressed clockwise from true north for map rendering.
+    vector_east = cov01
+    vector_north = major_variance - cov00
+    if abs(vector_east) + abs(vector_north) < 1e-9:
+        vector_east, vector_north = 0.0, 1.0
+    ellipse_bearing = math.degrees(math.atan2(vector_east, vector_north)) % 360.0
+
+    avg_confidence = sum(item[3] for item in valid) / len(valid)
+    forward_factor = forward / len(projected)
+    uncertainty_factor = 1.0 / (1.0 + major_radius / max(50.0, baseline_m * 2.0))
+    confidence = max(0.0, min(1.0, avg_confidence * math.sqrt(geometry_ratio) * forward_factor * uncertainty_factor))
+    estimate = {
+        "lat": reference_lat + estimate_north / meters_per_lat,
+        "lon": reference_lon + estimate_east / meters_per_lon,
+        "radius_m": major_radius,
+        "major_radius_m": major_radius,
+        "minor_radius_m": minor_radius,
+        "ellipse_bearing_deg": ellipse_bearing,
+        "confidence": confidence,
+        "point_count": len(valid),
+        "baseline_m": baseline_m,
+        "method": "multi-antenna bearing intersection",
+    }
+    if logger is not None:
+        logger.debug(
+            "Array-bearing transmitter estimate: %.6f, %.6f (ellipse %.1fm x %.1fm)",
+            estimate["lat"], estimate["lon"], major_radius, minor_radius,
+        )
+    return estimate
+
 def _alert_font(size=26):
     try:
         return ImageFont.truetype("arialbd.ttf", size)

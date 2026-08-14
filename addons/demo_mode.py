@@ -31,6 +31,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "update_interval_s": 0.0,
     "satellite_count": 9,
     "signal_noise": 0.08,
+    "scenario_period_s": 120.0,
+    "fault_simulation": True,
+    "antenna_beamwidth_deg": 70.0,
+    "antenna_front_back_db": 18.0,
 }
 
 
@@ -95,6 +99,11 @@ class DemoSettingsDialog(QtWidgets.QDialog):
         self.update_interval = QtWidgets.QLineEdit(str(self._config.get("update_interval_s", "")))
         self.satellite_count = QtWidgets.QLineEdit(str(self._config.get("satellite_count", "")))
         self.signal_noise = QtWidgets.QLineEdit(str(self._config.get("signal_noise", "")))
+        self.scenario_period = QtWidgets.QLineEdit(str(self._config.get("scenario_period_s", "")))
+        self.beamwidth = QtWidgets.QLineEdit(str(self._config.get("antenna_beamwidth_deg", "")))
+        self.front_back = QtWidgets.QLineEdit(str(self._config.get("antenna_front_back_db", "")))
+        self.fault_simulation = QtWidgets.QCheckBox("Cycle through interference, GPS degradation, SDR dropout, stops, and multipath")
+        self.fault_simulation.setChecked(bool(self._config.get("fault_simulation", True)))
 
         self.center_lat.setValidator(QtGui.QDoubleValidator(-90.0, 90.0, 6))
         self.center_lon.setValidator(QtGui.QDoubleValidator(-180.0, 180.0, 6))
@@ -106,11 +115,14 @@ class DemoSettingsDialog(QtWidgets.QDialog):
         self.update_interval.setValidator(QtGui.QDoubleValidator(0.0, 60.0, 2))
         self.satellite_count.setValidator(QtGui.QIntValidator(4, 32))
         self.signal_noise.setValidator(QtGui.QDoubleValidator(0.0, 0.5, 3))
+        self.scenario_period.setValidator(QtGui.QDoubleValidator(30.0, 3600.0, 1))
+        self.beamwidth.setValidator(QtGui.QDoubleValidator(10.0, 180.0, 1))
+        self.front_back.setValidator(QtGui.QDoubleValidator(1.0, 60.0, 1))
 
         form = QtWidgets.QFormLayout()
         form.addRow("Center Latitude", self.center_lat)
         form.addRow("Center Longitude", self.center_lon)
-        form.addRow("Path Radius (m)", self.radius_m)
+        form.addRow("Patrol Extent (m)", self.radius_m)
         form.addRow("Speed (m/s)", self.speed_mps)
         form.addRow("Target Bearing (deg)", self.target_bearing)
         form.addRow("Target Distance (m)", self.target_distance)
@@ -118,6 +130,16 @@ class DemoSettingsDialog(QtWidgets.QDialog):
         form.addRow("Update Interval (s, 0=auto)", self.update_interval)
         form.addRow("Satellite Count", self.satellite_count)
         form.addRow("Signal Noise (0-0.5)", self.signal_noise)
+        form.addRow("Scenario Cycle (s)", self.scenario_period)
+        form.addRow("Directional Beamwidth (deg)", self.beamwidth)
+        form.addRow("Front/Back Ratio (dB)", self.front_back)
+        form.addRow("Field Conditions", self.fault_simulation)
+
+        note = QtWidgets.QLabel(
+            "Demo Mode generates complex IQ samples and feeds them through Pinpoint's normal DSP, "
+            "direction finding, confidence, map, health, and alert paths. The route is an irregular patrol—not a scripted circle."
+        )
+        note.setWordWrap(True)
 
         btns = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Save
@@ -127,6 +149,7 @@ class DemoSettingsDialog(QtWidgets.QDialog):
         btns.rejected.connect(self.reject)
 
         layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(note)
         layout.addLayout(form)
         layout.addWidget(btns)
 
@@ -143,6 +166,10 @@ class DemoSettingsDialog(QtWidgets.QDialog):
             cfg["update_interval_s"] = float(self.update_interval.text())
             cfg["satellite_count"] = int(self.satellite_count.text())
             cfg["signal_noise"] = float(self.signal_noise.text())
+            cfg["scenario_period_s"] = float(self.scenario_period.text())
+            cfg["antenna_beamwidth_deg"] = float(self.beamwidth.text())
+            cfg["antenna_front_back_db"] = float(self.front_back.text())
+            cfg["fault_simulation"] = self.fault_simulation.isChecked()
         except Exception:
             QtWidgets.QMessageBox.critical(self, "Invalid Input", "Please enter valid numeric values.")
             return
@@ -172,8 +199,8 @@ def plugin_entry(api: PinpointAPI) -> AddonPlugin:
     return AddonPlugin(
         id="demo_mode",
         name="Demo Mode",
-        version="1.0.0",
-        description="Simulated GPS/SDR demo that runs without hardware.",
+        version="2.0.0",
+        description="Scenario-driven GPS/RF demo with generated IQ, interference, faults, mapping, and alerts.",
         menu=[
             AddonAction(
                 id="demo_start",

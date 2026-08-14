@@ -715,7 +715,7 @@ def test_collector_keeps_sdr_configured_and_gps_fixed(core_module, monkeypatch):
     assert all(update["gps_fix"] is True for update in updates)
     calculation = updates[0]["calculation_parameters"]
     assert calculation["configured_settings"]["frequency"] == core_module.settings.frequency
-    assert calculation["effective"]["bearing_method"] == "amplitude-derived"
+    assert calculation["effective"]["bearing_method"] == "directional-pattern amplitude comparison"
     assert calculation["effective"]["antenna_count"] == 1
 
 
@@ -1318,6 +1318,124 @@ def test_transmitter_estimate_includes_confidence_radius():
     assert estimate["radius_m"] >= 10.0
     assert 0.0 <= estimate["confidence"] <= 1.0
     assert estimate["point_count"] == 3
+
+
+def test_array_bearing_estimate_returns_oriented_uncertainty_ellipse():
+    observations = [
+        {"lat": 35.0, "lon": -80.001, "bearing_deg": 90.0, "confidence": 0.9},
+        {"lat": 34.999, "lon": -80.0, "bearing_deg": 0.0, "confidence": 0.85},
+        {"lat": 35.0, "lon": -79.999, "bearing_deg": 270.0, "confidence": 0.8},
+    ]
+    estimate = map_mod.estimateTransmitterFromBearings(observations, logging.getLogger("test"))
+    assert estimate["lat"] == pytest.approx(35.0, abs=1e-6)
+    assert estimate["lon"] == pytest.approx(-80.0, abs=1e-6)
+    assert estimate["major_radius_m"] >= estimate["minor_radius_m"] >= 8.0
+    assert 0.0 <= estimate["ellipse_bearing_deg"] < 360.0
+    assert estimate["method"] == "multi-antenna bearing intersection"
+
+
+def test_array_bearing_estimate_rejects_insufficient_or_parallel_geometry():
+    with pytest.raises(ValueError):
+        map_mod.estimateTransmitterFromBearings(
+            [
+                {"lat": 35.0, "lon": -80.0, "bearing_deg": 90.0},
+                {"lat": 35.0, "lon": -80.001, "bearing_deg": 90.0},
+            ],
+            logging.getLogger("test"),
+        )
+    with pytest.raises(ValueError):
+        map_mod.estimateTransmitterFromBearings(
+            [
+                {"lat": 35.0, "lon": -80.002, "bearing_deg": 90.0},
+                {"lat": 35.0, "lon": -80.001, "bearing_deg": 90.0},
+                {"lat": 35.0, "lon": -80.0, "bearing_deg": 90.0},
+            ],
+            logging.getLogger("test"),
+        )
+
+
+def test_single_antenna_never_produces_array_direction(core_module):
+    assert core_module._aoa_from_strengths([500.0], [0.0]) == (None, 0.0)
+    assert core_module._aoa_from_strengths([500.0, 500.0], [0.0, 180.0]) == (None, 0.0)
+
+
+def test_directional_pattern_bearing_recovers_characterized_direction(core_module):
+    angles = [0.0, 90.0, 180.0, 270.0]
+    target = 35.0
+    strengths = [
+        500.0 * 10.0 ** (core_module._pattern_gain_db(target - angle, 70.0, 18.0) / 20.0)
+        for angle in angles
+    ]
+    bearing, confidence = core_module._amplitude_bearing_from_pattern(
+        strengths, angles, 70.0, 18.0
+    )
+    assert bearing == pytest.approx(target, abs=1.0)
+    assert confidence > 0.5
+
+
+def test_heading_tracker_requires_motion_and_expires(core_module):
+    tracker = core_module._HeadingTracker()
+    config = {
+        "heading_min_speed_knots": 2.0,
+        "heading_min_baseline_m": 10.0,
+        "heading_accuracy_factor": 2.0,
+        "heading_stale_s": 5.0,
+        "heading_smoothing": 1.0,
+    }
+    state = tracker.update((35.0, -80.0), 0.0, config, speed_knots=0.0, gps_accuracy_m=3.0)
+    assert state["valid"] is False
+    state = tracker.update(
+        (35.0, -80.0001), 1.0, config,
+        course_deg=90.0, speed_knots=5.0, gps_accuracy_m=3.0, motion_age_s=0.0,
+    )
+    assert state["heading"] == pytest.approx(90.0)
+    assert state["source"] == "gps-course"
+    state = tracker.update(None, 7.0, config, speed_knots=0.0)
+    assert state["valid"] is False
+    assert state["heading"] is None
+
+
+def test_fusion_confidence_penalizes_low_confidence_and_disagreement(core_module):
+    bearing, confidence = core_module._fuse_bearings([(45.0, 0.05), (45.0, 0.05)])
+    assert bearing == pytest.approx(45.0)
+    assert confidence == pytest.approx(0.1)
+    assert core_module._fuse_bearings([(90.0, 0.5), (270.0, 0.5)]) == (None, 0.0)
+
+
+def test_demo_generates_iq_that_uses_production_signal_processing(core_module):
+    worker = core_module.DemoCollectorThread(logging.getLogger("test"), threading.Event(), {"seed": 9})
+    nominal = worker._simulate_iq(0.25, 0.0, 4096)
+    interfered = worker._simulate_iq(0.25, 0.6, 4096)
+    assert np.iscomplexobj(nominal)
+    assert len(nominal) == 4096
+    nominal_strength = funcs.calculateSignalStrength(funcs.processSamples(nominal))
+    interfered_strength = funcs.calculateSignalStrength(funcs.processSamples(interfered))
+    assert interfered_strength > nominal_strength
+    assert len(funcs.calculateSpectrum(interfered)) >= 16
+
+
+def test_interactive_map_direction_requires_multiple_connected_antennas():
+    from pinpoint.main_window import MainWindow
+
+    one_channel = {
+        "gps_loc": (35.0, -80.0),
+        "aoa_bearing": 45.0,
+        "aoa_confidence": 0.8,
+        "antenna_count": 1,
+    }
+    window = types.SimpleNamespace(_map_telemetry_frames=lambda: [{"telemetry": one_channel}])
+    window._array_channel_count = MainWindow._array_channel_count
+    assert MainWindow._get_map_direction_overlay(window) is None
+
+    two_channels = dict(one_channel, antenna_count=2)
+    window._map_telemetry_frames = lambda: [{"telemetry": two_channels}]
+    direction = MainWindow._get_map_direction_overlay(window)
+    assert direction["bearing_deg"] == pytest.approx(45.0)
+    assert direction["antenna_count"] == 2
+
+    no_fix = dict(two_channels, gps_fix=False)
+    window._map_telemetry_frames = lambda: [{"telemetry": two_channels}, {"telemetry": no_fix}]
+    assert MainWindow._get_map_direction_overlay(window) is None
 
 
 def test_map_function_offline(tmp_path):

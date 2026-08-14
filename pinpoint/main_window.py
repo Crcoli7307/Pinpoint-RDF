@@ -744,7 +744,7 @@ class MainWindow(QtWidgets.QMainWindow):
             aoa = "--" if self.aoa_confidence is None else f"{self.aoa_confidence:.2f}"
             mp = "--" if self.map_confidence is None else f"{self.map_confidence:.2f}"
             fu = "--" if self.fusion_confidence is None else f"{self.fusion_confidence:.2f}"
-            conf_text = f"A:{aoa}  M:{mp}  F:{fu}"
+            conf_text = f"AMP:{aoa}  MAP:{mp}  FUSED:{fu}"
 
         self.info_summary.setText(
             f"Mode: {mode}  |  Activity: {activity}  |  Recording: {record_text}  |  Playback: {playback_text}"
@@ -1485,7 +1485,7 @@ class MainWindow(QtWidgets.QMainWindow):
         details: dict[str, dict] = {}
         for frame_index, frame in enumerate(frames):
             tele = frame.get("telemetry") or {}
-            if tele.get("cycle_paused"):
+            if tele.get("gps_fix") is False or tele.get("cycle_paused"):
                 continue
             gps_loc = tele.get("gps_loc")
             if not gps_loc:
@@ -1557,7 +1557,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "gps": "GPS",
             "sdr": "SDR",
             "snr": "SNR",
-            "aoa": "AoA",
+            "aoa": "Amplitude DF",
             "hdop": "HDOP",
             "fft": "FFT",
             "id": "ID",
@@ -1884,7 +1884,7 @@ class MainWindow(QtWidgets.QMainWindow):
         frames = self.playback_frames[: max(0, idx) + 1]
         for frame_index, frame in enumerate(frames):
             telemetry = frame.get("telemetry") or {}
-            if telemetry.get("cycle_paused"):
+            if telemetry.get("gps_fix") is False or telemetry.get("cycle_paused"):
                 continue
             gps_loc = telemetry.get("gps_loc")
             if not gps_loc:
@@ -2326,19 +2326,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self.antenna_count = int(antenna_count)
         if antenna_states is not None:
             self.antenna_states = antenna_states
-        if current_bearing is not None:
+        if "current_bearing" in data:
             self.current_bearing = current_bearing
-        if target_bearing is not None:
+        if "target_bearing" in data:
             self.target_bearing = target_bearing
-        if target_relative is not None:
+        if "target_relative" in data:
             self.target_relative = target_relative
-        if aoa_conf is not None:
+        if "aoa_confidence" in data:
             self.aoa_confidence = aoa_conf
-        if map_conf is not None:
+        if "map_confidence" in data:
             self.map_confidence = map_conf
-        if fusion_conf is not None:
+        if "fusion_confidence" in data:
             self.fusion_confidence = fusion_conf
-        if bearing_source is not None:
+        if "bearing_source" in data:
             self.bearing_source = bearing_source
         effective_gps_fix = gps_fix
         if (
@@ -2540,6 +2540,108 @@ class MainWindow(QtWidgets.QMainWindow):
             last.get("strength"),
         )
 
+    def _map_telemetry_frames(self) -> list[dict]:
+        frames = list(getattr(self, "report_cache_frames", []) or [])
+        if getattr(self, "playback_mode", False) and getattr(self, "playback_frames", None):
+            frames = list(self.playback_frames[: self.playback_index + 1])
+        return frames
+
+    @staticmethod
+    def _array_channel_count(telemetry: dict) -> int:
+        states = telemetry.get("antenna_states") or []
+        if states:
+            return sum(
+                1 for state in states
+                if state.get("connected") and state.get("strength") is not None
+            )
+        try:
+            return int(telemetry.get("antenna_count") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _get_array_bearing_observations(self) -> list[dict]:
+        observations = []
+        for frame in self._map_telemetry_frames():
+            telemetry = frame.get("telemetry") or {}
+            if (
+                telemetry.get("gps_fix") is False
+                or telemetry.get("cycle_paused")
+                or self._array_channel_count(telemetry) < 2
+            ):
+                continue
+            gps_loc = telemetry.get("gps_loc")
+            bearing = telemetry.get("aoa_bearing")
+            confidence = telemetry.get("aoa_confidence")
+            if not gps_loc or bearing is None or confidence is None:
+                continue
+            try:
+                confidence = float(confidence)
+                if confidence < 0.05:
+                    continue
+                observations.append(
+                    {
+                        "lat": float(gps_loc[0]),
+                        "lon": float(gps_loc[1]),
+                        "bearing_deg": float(bearing),
+                        "confidence": float(confidence),
+                    }
+                )
+            except (TypeError, ValueError, IndexError):
+                continue
+        return observations[-100:]
+
+    def _get_map_target_estimate(self) -> Optional[dict]:
+        # Clear the estimate immediately when the current accepted fix no longer
+        # has a usable array; do not leave a stale ellipse on screen.
+        for frame in reversed(self._map_telemetry_frames()):
+            telemetry = frame.get("telemetry") or {}
+            if telemetry.get("gps_fix") is False:
+                return None
+            if telemetry.get("cycle_paused") or not telemetry.get("gps_loc"):
+                continue
+            if self._array_channel_count(telemetry) < 2:
+                return None
+            break
+        try:
+            return funcs.estimateTransmitterFromBearings(
+                self._get_array_bearing_observations(), logger
+            )
+        except ValueError:
+            return None
+        except Exception:
+            logger.exception("Could not calculate the interactive-map transmitter ellipse.")
+            return None
+
+    def _get_map_direction_overlay(self) -> Optional[dict]:
+        for frame in reversed(self._map_telemetry_frames()):
+            telemetry = frame.get("telemetry") or {}
+            if telemetry.get("gps_fix") is False:
+                return None
+            if telemetry.get("cycle_paused") or not telemetry.get("gps_loc"):
+                continue
+            if self._array_channel_count(telemetry) < 2:
+                return None
+            gps_loc = telemetry.get("gps_loc")
+            bearing = telemetry.get("aoa_bearing")
+            confidence = telemetry.get("aoa_confidence")
+            if bearing is None or confidence is None:
+                return None
+            try:
+                confidence = float(confidence)
+                if confidence < 0.05:
+                    return None
+                return {
+                    "lat": float(gps_loc[0]),
+                    "lon": float(gps_loc[1]),
+                    "bearing_deg": float(bearing) % 360.0,
+                    "confidence": max(0.0, min(1.0, float(confidence))),
+                    "antenna_count": self._array_channel_count(telemetry),
+                    "length_m": 150.0,
+                }
+            except (TypeError, ValueError, IndexError):
+                continue
+        return None
+
     def _get_map_alerts(self) -> list[str]:
         if self.playback_mode or self.demo_active or self.playback_only or self.meshtastic_only:
             return []
@@ -2572,7 +2674,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_alert_manager(self, data: dict) -> None:
         with settings_lock:
             debounce = max(1, int(settings.alert_debounce_cycles))
-        live = not (self.playback_mode or self.demo_active or self.playback_only or self.meshtastic_only)
+        # Demo telemetry intentionally exercises the same alert presentation as
+        # field telemetry; only playback and non-collection modes suppress it.
+        live = not (self.playback_mode or self.playback_only or self.meshtastic_only)
         antenna_states = data.get("antenna_states") or self.antenna_states or []
         degraded = any(state.get("health") == "Degraded" for state in antenna_states)
         accuracy = data.get("gps_accuracy_m", self.latest_gps_accuracy_m)
@@ -2596,6 +2700,14 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.alert_manager.update(
             "sdr_degraded", live and degraded, "SDR DEGRADED", "warning", debounce
+        )
+        self.alert_manager.update(
+            "interference", live and bool(data.get("interference_detected")),
+            "RF INTERFERENCE", "warning", 1,
+        )
+        self.alert_manager.update(
+            "demo_scenario", live and self.demo_active and bool(data.get("demo_scenario")),
+            f"DEMO: {data.get('demo_scenario')}", "debug", 1,
         )
 
     def _get_map_notifications(self) -> list[dict]:
@@ -2633,12 +2745,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self._disable_interactive_map()
             return
         points = self._get_history_points()
+        target_estimate = self._get_map_target_estimate()
+        array_direction = self._get_map_direction_overlay()
         sig = (
             self._map_points_signature(points),
             tuple(self._get_map_alerts()),
             tuple(self._get_map_warnings()),
             tuple((item["key"], item["severity"]) for item in self._get_map_notifications()),
-            json.dumps(self.latest_target_estimate, sort_keys=True),
+            json.dumps(target_estimate, sort_keys=True),
+            json.dumps(array_direction, sort_keys=True),
         )
         now = time.time()
         if not force and (sig == self._last_map_sig) and (now - self._last_map_update) < MAP_UPDATE_INTERVAL_S:
@@ -2667,7 +2782,8 @@ class MainWindow(QtWidgets.QMainWindow):
         alerts_js = json.dumps(self._get_map_alerts())
         warnings_js = json.dumps(getattr(self, "_get_map_warnings", lambda: [])())
         notifications_js = json.dumps(getattr(self, "_get_map_notifications", lambda: [])())
-        estimate_js = json.dumps(getattr(self, "latest_target_estimate", None))
+        estimate_js = json.dumps(getattr(self, "_get_map_target_estimate", lambda: None)())
+        direction_js = json.dumps(getattr(self, "_get_map_direction_overlay", lambda: None)())
         return f"""<!doctype html>
 <html>
 <head>
@@ -2847,13 +2963,22 @@ class MainWindow(QtWidgets.QMainWindow):
       if (!estimate || estimate.lat == null || estimate.lon == null || !estimate.radius_m) return null;
       const coordinates = [];
       const latRad = Number(estimate.lat) * Math.PI / 180.0;
+      const major = Number(estimate.major_radius_m || estimate.radius_m);
+      const minor = Number(estimate.minor_radius_m || estimate.radius_m);
+      const bearing = Number(estimate.ellipse_bearing_deg || 0.0) * Math.PI / 180.0;
       for (let i = 0; i <= 64; i++) {{
         const angle = (i / 64.0) * Math.PI * 2.0;
-        const dLat = (Number(estimate.radius_m) * Math.sin(angle)) / 111320.0;
-        const dLon = (Number(estimate.radius_m) * Math.cos(angle)) / Math.max(1.0, 111320.0 * Math.cos(latRad));
+        const east = major * Math.cos(angle) * Math.sin(bearing) + minor * Math.sin(angle) * Math.cos(bearing);
+        const north = major * Math.cos(angle) * Math.cos(bearing) - minor * Math.sin(angle) * Math.sin(bearing);
+        const dLat = north / 111320.0;
+        const dLon = east / Math.max(1.0, 111320.0 * Math.cos(latRad));
         coordinates.push([Number(estimate.lon) + dLon, Number(estimate.lat) + dLat]);
       }}
-      return {{ type: 'Feature', geometry: {{ type: 'Polygon', coordinates: [coordinates] }} }};
+      return {{
+        type: 'Feature',
+        properties: {{ confidence: Number(estimate.confidence || 0), method: String(estimate.method || '') }},
+        geometry: {{ type: 'Polygon', coordinates: [coordinates] }}
+      }};
     }}
 
     function updateTargetEstimate(estimate) {{
@@ -2866,6 +2991,42 @@ class MainWindow(QtWidgets.QMainWindow):
       el.className = 'pin';
       el.style.backgroundColor = '#10b981';
       targetMarker = new mapboxgl.Marker(el).setLngLat([estimate.lon, estimate.lat]).addTo(map);
+    }}
+
+    function destinationPoint(direction) {{
+      if (!direction || direction.lat == null || direction.lon == null || direction.bearing_deg == null) return null;
+      const distance = Number(direction.length_m || 150.0);
+      const bearing = Number(direction.bearing_deg) * Math.PI / 180.0;
+      const latRad = Number(direction.lat) * Math.PI / 180.0;
+      return [
+        Number(direction.lon) + (distance * Math.sin(bearing)) / Math.max(1.0, 111320.0 * Math.cos(latRad)),
+        Number(direction.lat) + (distance * Math.cos(bearing)) / 111320.0
+      ];
+    }}
+
+    function updateArrayDirection(direction) {{
+      const lineSource = map.getSource('array-bearing');
+      const headSource = map.getSource('array-bearing-head');
+      const endpoint = destinationPoint(direction);
+      if (!lineSource || !headSource) return;
+      if (!endpoint) {{
+        lineSource.setData({{ type: 'FeatureCollection', features: [] }});
+        headSource.setData({{ type: 'FeatureCollection', features: [] }});
+        return;
+      }}
+      const properties = {{
+        confidence: Number(direction.confidence || 0),
+        antenna_count: Number(direction.antenna_count || 0),
+        rotation: Number(direction.bearing_deg) - 90.0
+      }};
+      lineSource.setData({{
+        type: 'Feature', properties,
+        geometry: {{ type: 'LineString', coordinates: [[Number(direction.lon), Number(direction.lat)], endpoint] }}
+      }});
+      headSource.setData({{
+        type: 'Feature', properties,
+        geometry: {{ type: 'Point', coordinates: endpoint }}
+      }});
     }}
 
     function addMarkers(data) {{
@@ -2919,9 +3080,10 @@ class MainWindow(QtWidgets.QMainWindow):
       document.querySelectorAll('.pin.selected').forEach(node => node.classList.remove('selected'));
     }};
 
-    window.updateMarkers = function(data, center, forceFollow, alerts, warnings, notifications, targetEstimate) {{
+    window.updateMarkers = function(data, center, forceFollow, alerts, warnings, notifications, targetEstimate, arrayDirection) {{
       updateSystemAlerts(alerts, warnings, notifications);
       updateTargetEstimate(targetEstimate);
+      updateArrayDirection(arrayDirection);
       if (forceFollow) {{
         followMode = true;
       }}
@@ -2939,7 +3101,15 @@ class MainWindow(QtWidgets.QMainWindow):
       map.addSource('target-confidence', {{ type: 'geojson', data: {{ type: 'FeatureCollection', features: [] }} }});
       map.addLayer({{ id: 'target-confidence-fill', type: 'fill', source: 'target-confidence', paint: {{ 'fill-color': '#10b981', 'fill-opacity': 0.16 }} }});
       map.addLayer({{ id: 'target-confidence-line', type: 'line', source: 'target-confidence', paint: {{ 'line-color': '#10b981', 'line-width': 2 }} }});
-      window.updateMarkers({points_js}, {center_js}, true, {alerts_js}, {warnings_js}, {notifications_js}, {estimate_js});
+      map.addSource('array-bearing', {{ type: 'geojson', data: {{ type: 'FeatureCollection', features: [] }} }});
+      map.addLayer({{ id: 'array-bearing-line', type: 'line', source: 'array-bearing', paint: {{ 'line-color': '#f97316', 'line-width': 4, 'line-opacity': 0.9 }} }});
+      map.addSource('array-bearing-head', {{ type: 'geojson', data: {{ type: 'FeatureCollection', features: [] }} }});
+      map.addLayer({{
+        id: 'array-bearing-arrowhead', type: 'symbol', source: 'array-bearing-head',
+        layout: {{ 'text-field': '>', 'text-size': 24, 'text-rotate': ['get', 'rotation'], 'text-rotation-alignment': 'map', 'text-allow-overlap': true }},
+        paint: {{ 'text-color': '#f97316', 'text-halo-color': '#ffffff', 'text-halo-width': 1.5 }}
+      }});
+      window.updateMarkers({points_js}, {center_js}, true, {alerts_js}, {warnings_js}, {notifications_js}, {estimate_js}, {direction_js});
     }});
   </script>
 </body>
@@ -2951,8 +3121,9 @@ class MainWindow(QtWidgets.QMainWindow):
         alerts_js = json.dumps(self._get_map_alerts())
         warnings_js = json.dumps(getattr(self, "_get_map_warnings", lambda: [])())
         notifications_js = json.dumps(getattr(self, "_get_map_notifications", lambda: [])())
-        estimate_js = json.dumps(getattr(self, "latest_target_estimate", None))
-        return f"if (window.updateMarkers) {{ window.updateMarkers({points_js}, {center_js}, false, {alerts_js}, {warnings_js}, {notifications_js}, {estimate_js}); }}"
+        estimate_js = json.dumps(getattr(self, "_get_map_target_estimate", lambda: None)())
+        direction_js = json.dumps(getattr(self, "_get_map_direction_overlay", lambda: None)())
+        return f"if (window.updateMarkers) {{ window.updateMarkers({points_js}, {center_js}, false, {alerts_js}, {warnings_js}, {notifications_js}, {estimate_js}, {direction_js}); }}"
 
     def _map_center(self, points: list[dict]) -> list[float]:
         if points:

@@ -589,7 +589,8 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
         )
 
         method = (
-            "The system compared relative signal measurements across the antenna array to calculate an amplitude-derived direction. "
+            "When a characterized directional-array profile was enabled, the system compared relative signal measurements "
+            "against that antenna pattern to calculate an amplitude-comparison direction. "
             "Where sufficient GPS history was available, Pinpoint also calculated a map-derived direction and combined the available "
             "estimates according to the configured confidence rules. Bearings and location estimates in this report are analytical "
             "outputs intended to support operational decision-making; they are not independent confirmation of a transmitter's identity or location."
@@ -732,8 +733,17 @@ class ReportGeneratorDialog(QtWidgets.QDialog):
             ("Collection cadence", _fmt_num(self._settings.get("collection_time"), 0, " s")),
             ("SDR sample window", _fmt_num(self._settings.get("sample_window_s"), 2, " s")),
             ("Antenna channels", str(self._infer_antenna_count() or "--")),
+            (
+                "Characterized directional array",
+                "Enabled" if self._settings.get("directional_array_enabled") else "Disabled",
+            ),
+            ("Directional beamwidth", _fmt_num(self._settings.get("antenna_beamwidth_deg"), 1, " deg")),
+            ("Front/back response", _fmt_num(self._settings.get("antenna_front_back_db"), 1, " dB")),
             ("Movement threshold", _fmt_num(self._settings.get("movement_threshold_m"), 1, " m")),
             ("Adaptive movement pause", "Enabled" if self._settings.get("adaptive_movement_pause") else "Disabled"),
+            ("Heading minimum speed", _fmt_num(self._settings.get("heading_min_speed_knots"), 1, " kn")),
+            ("Heading displacement baseline", _fmt_num(self._settings.get("heading_min_baseline_m"), 1, " m")),
+            ("Heading expiry", _fmt_num(self._settings.get("heading_stale_s"), 1, " s")),
             ("Confidence threshold", _fmt_num(self._settings.get("confidence_threshold"), 2)),
         ]
         configuration_html = "".join(

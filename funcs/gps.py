@@ -167,6 +167,7 @@ def _gps_reader_state(nmea_reader):
             "altitude_m": None,
             "speed_knots": None,
             "course_deg": None,
+            "motion_ts": None,
         }
         try:
             setattr(nmea_reader, "_pinpoint_state", state)
@@ -183,6 +184,7 @@ def get_gps_metadata(nmea_reader):
         "altitude_m": state.get("altitude_m"),
         "speed_knots": state.get("speed_knots"),
         "course_deg": state.get("course_deg"),
+        "motion_ts": state.get("motion_ts"),
     }
 
 
@@ -255,6 +257,7 @@ def readGPS(logger, serial_port=None, nmea_reader=None, stop_event=None, max_wai
                     position_data_seen = True
                     reader_state["speed_knots"] = _safe_float(getattr(msg, "spd_over_grnd", None))
                     reader_state["course_deg"] = _safe_float(getattr(msg, "true_course", None))
+                    reader_state["motion_ts"] = time.time()
                     if (
                         getattr(msg, "status", "A") == "A"
                         and msg.latitude != 0.0
